@@ -1,0 +1,1 @@
+"""Local NiceGUI presentation layer."""
