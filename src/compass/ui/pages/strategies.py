@@ -11,6 +11,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
 
 from nicegui import ui
+import pandas as pd  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
 from compass.domain.market import AssetType, InstrumentId
@@ -23,6 +24,14 @@ from compass.services.safe_display import (
 from compass.services.task_manager import Operation, TaskSnapshot, TaskStatus
 from compass.strategies.base import StrategyFrequency, StrategyMetadata
 from compass.strategies.registry import StrategyRegistry
+from compass.strategies.rule_document import (
+    RuleSide,
+    RuleStrategyDraft,
+    StrategyRuleDocument,
+    default_rule_document,
+    document_from_parameters,
+)
+from compass.strategies.rule_dsl import RuleDslParameters
 
 if TYPE_CHECKING:
     from compass.services.strategy_optimizer import (
@@ -64,6 +73,11 @@ _STRATEGY_GUIDES = {
         "用受限表达式组合价格、均线、RSI、上穿/下穿等条件，并分别定义买入与卖出逻辑。",
         "适合将明确的交易规则快速转换成可复现、可修改参数的策略实验。",
         "参数搜索容易过拟合；需要用样本外区间或滚动验证确认稳定性。",
+    ),
+    "kronos_forecast": (
+        "用 Kronos 生成未来 K 线预测，再按预测收益、路径一致性和长期趋势转换为目标仓位。",
+        "适合用 ETF 日线做低频、多标的预测实验，并与传统趋势策略组合比较。",
+        "模型预测不是确定收益；必须防止训练期泄漏，并计入下载、推理、采样不确定性和交易成本。",
     ),
 }
 
@@ -530,6 +544,66 @@ class StrategyGateway(Protocol):
     def quick_backtest(self, instance_id: str) -> None: ...
 
 
+class RuleDraftGateway(Protocol):
+    def list(self) -> Sequence[RuleStrategyDraft]: ...
+    def get(self, draft_id: str) -> RuleStrategyDraft: ...
+    def save(self, draft: RuleStrategyDraft) -> RuleStrategyDraft: ...
+    def delete(self, draft_id: str) -> bool: ...
+    def new_draft_id(self) -> str: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RulePreviewSignal:
+    day: date
+    instrument: InstrumentId
+    side: RuleSide
+    rule_id: str
+    rule_name: str
+    priority: int
+    target_weight: Decimal
+    close: Decimal
+
+    def __post_init__(self) -> None:
+        if type(self.day) is not date or type(self.instrument) is not InstrumentId:
+            raise TypeError("rule preview identity is invalid")
+        if type(self.side) is not RuleSide:
+            raise TypeError("rule preview side must be exact")
+        safe_identifier(self.rule_id, label="preview rule id")
+        safe_display_text(self.rule_name, label="preview rule name")
+        if type(self.priority) is not int:
+            raise TypeError("preview priority must be exact")
+        if (
+            type(self.target_weight) is not Decimal
+            or not self.target_weight.is_finite()
+            or not Decimal("0") <= self.target_weight <= Decimal("1")
+        ):
+            raise ValueError("preview target weight must be in [0, 1]")
+        if type(self.close) is not Decimal or not self.close.is_finite() or self.close <= 0:
+            raise ValueError("preview close must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class RulePreviewResult:
+    instrument: InstrumentId
+    first_day: date
+    last_day: date
+    bars: int
+    signals: tuple[RulePreviewSignal, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.instrument) is not InstrumentId:
+            raise TypeError("preview instrument must be exact")
+        if type(self.first_day) is not date or type(self.last_day) is not date:
+            raise TypeError("preview range must use dates")
+        if self.first_day > self.last_day or type(self.bars) is not int or self.bars <= 0:
+            raise ValueError("preview range is invalid")
+        if any(type(item) is not RulePreviewSignal for item in self.signals):
+            raise TypeError("preview signals must be exact")
+
+
+RulePreviewReader = Callable[[InstrumentId], "pd.DataFrame"]
+
+
 class TaskGateway(Protocol):
     def submit(self, name: str, heavy: bool, operation: Operation) -> TaskSnapshot: ...
     def status(self, task_id: str) -> TaskSnapshot: ...
@@ -622,13 +696,219 @@ class StrategyPageModel:
         gateway: StrategyGateway,
         tasks: TaskGateway,
         optimizer: StrategyOptimizerGateway | None = None,
+        drafts: RuleDraftGateway | None = None,
+        preview_reader: RulePreviewReader | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._registry = registry
         self._gateway = gateway
         self._tasks = tasks
         self._optimizer = optimizer
+        self._drafts = drafts
+        self._preview_reader = preview_reader
+        self._clock = clock
         self._optimization_task_id: str | None = None
         self._optimization_experiment_id: str | None = None
+        self._active_rule_draft_id: str | None = None
+
+    def select_rule_draft(self, draft_id: str) -> RuleStrategyDraft:
+        drafts = self._drafts
+        if drafts is None:
+            raise StrategyPageError("STRATEGY_DRAFTS_UNAVAILABLE")
+        draft = _boundary_call("STRATEGY_DRAFT_UNAVAILABLE", lambda: drafts.get(draft_id))
+        self._active_rule_draft_id = draft.draft_id
+        return draft
+
+    def active_rule_draft(self) -> RuleStrategyDraft | None:
+        drafts = self.rule_drafts()
+        if not drafts:
+            self._active_rule_draft_id = None
+            return None
+        selected = next(
+            (item for item in drafts if item.draft_id == self._active_rule_draft_id),
+            drafts[0],
+        )
+        self._active_rule_draft_id = selected.draft_id
+        return selected
+
+    def rule_drafts(self) -> tuple[RuleStrategyDraft, ...]:
+        drafts = self._drafts
+        if drafts is None:
+            return ()
+        return _boundary_call(
+            "STRATEGY_DRAFTS_UNAVAILABLE",
+            lambda: tuple(sorted(drafts.list(), key=lambda item: item.draft_id)),
+        )
+
+    def new_rule_draft(self, watchlist_id: str) -> RuleStrategyDraft:
+        drafts = self._drafts
+        if drafts is None or self._clock is None:
+            raise StrategyPageError("STRATEGY_DRAFTS_UNAVAILABLE")
+        pool = _boundary_call("STRATEGY_POOL_UNAVAILABLE", lambda: self._gateway.pool(watchlist_id))
+        draft = RuleStrategyDraft(
+            draft_id=drafts.new_draft_id(),
+            watchlist_id=pool.watchlist_id,
+            pool_snapshot_id=pool.snapshot_id,
+            document=default_rule_document(),
+            updated_at=self._clock(),
+        )
+        saved = _boundary_call("STRATEGY_DRAFT_SAVE_FAILED", lambda: drafts.save(draft))
+        self._active_rule_draft_id = saved.draft_id
+        return saved
+
+    def edit_rule_draft(self, instance_id: str) -> RuleStrategyDraft:
+        drafts = self._drafts
+        if drafts is None or self._clock is None:
+            raise StrategyPageError("STRATEGY_DRAFTS_UNAVAILABLE")
+        source = self._instance(instance_id)
+        if source.strategy_type != "rule_dsl":
+            raise StrategyPageError("STRATEGY_RULE_EDITOR_UNSUPPORTED")
+        parameters = RuleDslParameters.model_validate(source.parameters, strict=True)
+        draft = RuleStrategyDraft(
+            draft_id=drafts.new_draft_id(),
+            watchlist_id=source.watchlist_id,
+            pool_snapshot_id=source.pool_snapshot_id,
+            document=document_from_parameters(source.name, parameters),
+            updated_at=self._clock(),
+            source_instance_id=source.instance_id,
+        )
+        saved = _boundary_call("STRATEGY_DRAFT_SAVE_FAILED", lambda: drafts.save(draft))
+        self._active_rule_draft_id = saved.draft_id
+        return saved
+
+    def save_rule_draft(
+        self,
+        draft_id: str,
+        document: StrategyRuleDocument,
+    ) -> RuleStrategyDraft:
+        drafts = self._drafts
+        if drafts is None or self._clock is None:
+            raise StrategyPageError("STRATEGY_DRAFTS_UNAVAILABLE")
+        existing = _boundary_call("STRATEGY_DRAFT_UNAVAILABLE", lambda: drafts.get(draft_id))
+        revised = RuleStrategyDraft(
+            draft_id=existing.draft_id,
+            watchlist_id=existing.watchlist_id,
+            pool_snapshot_id=existing.pool_snapshot_id,
+            document=document,
+            updated_at=self._clock(),
+            source_instance_id=existing.source_instance_id,
+        )
+        saved = _boundary_call("STRATEGY_DRAFT_SAVE_FAILED", lambda: drafts.save(revised))
+        self._active_rule_draft_id = saved.draft_id
+        return saved
+
+    def delete_rule_draft(self, draft_id: str) -> bool:
+        drafts = self._drafts
+        if drafts is None:
+            raise StrategyPageError("STRATEGY_DRAFTS_UNAVAILABLE")
+        return _boundary_call("STRATEGY_DRAFT_DELETE_FAILED", lambda: drafts.delete(draft_id))
+
+    def rule_draft_instruments(self, draft_id: str) -> tuple[InstrumentId, ...]:
+        drafts = self._drafts
+        if drafts is None:
+            raise StrategyPageError("STRATEGY_DRAFTS_UNAVAILABLE")
+        draft = _boundary_call("STRATEGY_DRAFT_UNAVAILABLE", lambda: drafts.get(draft_id))
+        pool = _boundary_call(
+            "STRATEGY_POOL_UNAVAILABLE",
+            lambda: self._gateway.pool(draft.watchlist_id),
+        )
+        if pool.snapshot_id != draft.pool_snapshot_id:
+            raise StrategyPageError("STRATEGY_POOL_SNAPSHOT_CHANGED")
+        return pool.instruments
+
+    def publish_rule_draft(self, draft_id: str) -> StrategyInstance:
+        drafts = self._drafts
+        if drafts is None:
+            raise StrategyPageError("STRATEGY_DRAFTS_UNAVAILABLE")
+        draft = _boundary_call("STRATEGY_DRAFT_UNAVAILABLE", lambda: drafts.get(draft_id))
+        parameters = _parameters(draft.document.compile_parameters().model_dump(mode="json"))
+        strategy_draft = StrategyDraft(
+            name=draft.document.name,
+            strategy_type="rule_dsl",
+            strategy_version=self._registry.describe("rule_dsl").version,
+            watchlist_id=draft.watchlist_id,
+            pool_snapshot_id=draft.pool_snapshot_id,
+            frequency=StrategyFrequency.DAILY,
+            parameters=parameters,
+        )
+        if draft.source_instance_id is None:
+            published = _boundary_call(
+                "STRATEGY_PUBLISH_FAILED",
+                lambda: self._gateway.create(strategy_draft),
+            )
+        else:
+            published = _boundary_call(
+                "STRATEGY_PUBLISH_FAILED",
+                lambda: self._gateway.create_version(
+                    draft.source_instance_id or "", strategy_draft
+                ),
+            )
+        checked = self._validated_instance(published)
+        _boundary_call("STRATEGY_DRAFT_DELETE_FAILED", lambda: drafts.delete(draft.draft_id))
+        self._active_rule_draft_id = None
+        return checked
+
+    def preview_rule_draft(
+        self,
+        draft_id: str,
+        instrument: InstrumentId,
+        *,
+        maximum_signals: int = 100,
+    ) -> RulePreviewResult:
+        drafts = self._drafts
+        reader = self._preview_reader
+        if drafts is None or reader is None:
+            raise StrategyPageError("STRATEGY_PREVIEW_UNAVAILABLE")
+        if type(instrument) is not InstrumentId:
+            raise TypeError("preview instrument must be exact")
+        if type(maximum_signals) is not int or not 1 <= maximum_signals <= 500:
+            raise ValueError("preview signal limit is invalid")
+        draft = _boundary_call("STRATEGY_DRAFT_UNAVAILABLE", lambda: drafts.get(draft_id))
+        frame = _boundary_call("STRATEGY_PREVIEW_DATA_UNAVAILABLE", lambda: reader(instrument))
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            raise StrategyPageError("STRATEGY_PREVIEW_DATA_UNAVAILABLE")
+        document = draft.document
+        compiled = document.compiled_rules()
+        signals: list[RulePreviewSignal] = []
+        active_weight = Decimal("0")
+        for position in range(document.minimum_history - 1, len(frame)):
+            visible = frame.iloc[: position + 1]
+            matches = [
+                rule
+                for rule, program in compiled
+                if program.evaluate(visible, document.variable_values)
+            ]
+            if not matches:
+                continue
+            winner = matches[0]
+            target = Decimal("0") if winner.side is RuleSide.SELL else document.target_weight
+            if target == active_weight:
+                continue
+            active_weight = target
+            timestamp = frame.index[position]
+            if not isinstance(timestamp, pd.Timestamp):
+                timestamp = pd.Timestamp(timestamp)
+            signals.append(
+                RulePreviewSignal(
+                    day=timestamp.date(),
+                    instrument=instrument,
+                    side=winner.side,
+                    rule_id=winner.rule_id,
+                    rule_name=winner.name,
+                    priority=winner.priority,
+                    target_weight=target,
+                    close=Decimal(str(frame.iloc[position]["close"])),
+                )
+            )
+        first = pd.Timestamp(frame.index[0]).date()
+        last = pd.Timestamp(frame.index[-1]).date()
+        return RulePreviewResult(
+            instrument,
+            first,
+            last,
+            len(frame),
+            tuple(signals[-maximum_signals:]),
+        )
 
     def optimization_available(self) -> bool:
         return self._optimizer is not None
@@ -1079,9 +1359,7 @@ def render_strategies_page(model: StrategyPageModel | None) -> None:
                     value="ma_cross",
                     label="卖出条件",
                 ).classes("min-w-64")
-                target_weight = ui.number(
-                    "目标仓位（%）", value=100, min=1, max=100, step=5
-                )
+                target_weight = ui.number("目标仓位（%）", value=100, min=1, max=100, step=5)
 
             variable_controls: dict[str, tuple[object, object, object, object, object]] = {}
 
@@ -1138,8 +1416,7 @@ def render_strategies_page(model: StrategyPageModel | None) -> None:
                             "minimum": str(getattr(lower, "value")),
                             "maximum": str(getattr(upper, "value")),
                             "step": str(getattr(stride, "value")),
-                            "optimize": bool(getattr(optimize, "value"))
-                            and name in referenced,
+                            "optimize": bool(getattr(optimize, "value")) and name in referenced,
                         }
                     )
                 parameters_input.value = strategy_parameters_json(
@@ -1147,9 +1424,7 @@ def render_strategies_page(model: StrategyPageModel | None) -> None:
                         "buy_expression": buy_expression,
                         "sell_expression": sell_expression,
                         "variables": tuple(variables),
-                        "target_weight": str(
-                            Decimal(str(target_weight.value)) / Decimal("100")
-                        ),
+                        "target_weight": str(Decimal(str(target_weight.value)) / Decimal("100")),
                     }
                 )
                 parameters_input.update()
@@ -1164,9 +1439,7 @@ def render_strategies_page(model: StrategyPageModel | None) -> None:
                 "可用语法：sma、rsi、cross_above、cross_below、pct_change、"
                 "highest、lowest，以及 and / or / not 和数值比较。"
             ).classes("text-xs text-slate-500")
-            ui.label("没有被买卖表达式引用的变量不会交给优化器。").classes(
-                "text-xs text-slate-500"
-            )
+            ui.label("没有被买卖表达式引用的变量不会交给优化器。").classes("text-xs text-slate-500")
 
     custom_rule_builder()
     ui.label("参数说明（来自已注册策略定义）").classes("font-semibold")
@@ -1288,9 +1561,7 @@ def render_strategies_page(model: StrategyPageModel | None) -> None:
                 )
                 with ui.row().classes("w-full justify-end gap-2"):
                     ui.button("取消", on_click=delete_dialog.close).props("flat")
-                    ui.button("删除", on_click=delete_instance).props(
-                        "color=negative"
-                    )
+                    ui.button("删除", on_click=delete_instance).props("color=negative")
 
             with actions:
                 ui.button(icon="content_copy", on_click=copy_instance).props(
@@ -1322,9 +1593,7 @@ def _render_optimization_section(
     if not model.optimization_available():
         return
     candidates = tuple(
-        item
-        for item in state.instances
-        if item.enabled and item.strategy_type == "dual_ma"
+        item for item in state.instances if item.enabled and item.strategy_type == "dual_ma"
     )
     ui.separator().classes("my-6")
     ui.label("策略调优实验").classes("text-xl font-semibold")
@@ -1338,10 +1607,7 @@ def _render_optimization_section(
         )
         return
 
-    options = {
-        item.instance_id: f"{item.name}（v{item.version}）"
-        for item in candidates
-    }
+    options = {item.instance_id: f"{item.name}（v{item.version}）" for item in candidates}
     source = ui.select(
         options,
         value=candidates[0].instance_id,
@@ -1371,8 +1637,9 @@ def _render_optimization_section(
         short_input = ui.input("短均线候选", value="10,20,30")
         long_input = ui.input("长均线候选", value="40,60,90")
         confirmation_input = ui.input("确认天数候选", value="1,2,3")
-    ui.label("候选值用逗号分隔，例如 10,20,30。短均线必须小于长均线。") \
-        .classes("text-xs text-slate-500")
+    ui.label("候选值用逗号分隔，例如 10,20,30。短均线必须小于长均线。").classes(
+        "text-xs text-slate-500"
+    )
     feedback = ui.label("").classes("text-sm text-red-700")
 
     def parse_values(raw: object) -> tuple[int, ...]:
@@ -1407,8 +1674,9 @@ def _render_optimization_section(
             )
 
     ui.button("开始调优实验", icon="tune", on_click=start_experiment).props("color=primary")
-    ui.label("最多运行 50 组有效组合；实验回测不会进入普通回测任务历史。") \
-        .classes("text-xs text-slate-500")
+    ui.label("最多运行 50 组有效组合；实验回测不会进入普通回测任务历史。").classes(
+        "text-xs text-slate-500"
+    )
 
     task = model.optimization_task()
     active_statuses = {
@@ -1429,8 +1697,7 @@ def _render_optimization_section(
         if task.failure is not None:
             text += f"（{task.failure.code} / 错误 ID {task.failure.error_id}）"
         ui.label(text).classes(
-            "text-sm "
-            + ("text-red-700" if task.status is TaskStatus.FAILED else "text-blue-700")
+            "text-sm " + ("text-red-700" if task.status is TaskStatus.FAILED else "text-blue-700")
         )
         progress = model.optimization_progress()
         phase_labels = {
@@ -1455,6 +1722,7 @@ def _render_optimization_section(
                 "每组参数会先运行训练区间，再运行验证区间；因此同一个参数编号会显示两个阶段。"
             ).classes("text-xs text-slate-500")
         if task.status in active_statuses:
+
             def poll() -> None:
                 current = model.optimization_task()
                 if current is not None and current.status not in active_statuses:
@@ -1486,6 +1754,7 @@ def _render_optimization_section(
                         f"训练截至 {experiment.training_end} · 验证截至 {experiment.validation_end}"
                     ).classes("text-sm text-slate-600")
                 if experiment.published_instance_id is None:
+
                     def publish(experiment_id: str = experiment.experiment_id) -> None:
                         try:
                             created = model.publish_optimization(experiment_id)
@@ -1515,8 +1784,7 @@ def _render_optimization_section(
                     {
                         "rank": trial.rank,
                         "parameters": (
-                            f"{trial.short_window}/{trial.long_window}/"
-                            f"{trial.confirmation_days}"
+                            f"{trial.short_window}/{trial.long_window}/{trial.confirmation_days}"
                         ),
                         "training": percent(trial.training.total_return),
                         "validation": percent(trial.validation.total_return),
@@ -1533,9 +1801,7 @@ def _render_optimization_section(
                             else percent(trial.frozen_test.total_return)
                         ),
                         "status": (
-                            "可发布"
-                            if trial.eligible
-                            else (trial.rejection_reason or "未通过")
+                            "可发布" if trial.eligible else (trial.rejection_reason or "未通过")
                         ),
                     }
                 )

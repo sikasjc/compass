@@ -246,9 +246,7 @@ def test_calendar_failure_has_a_specific_sync_error_before_market_requests(
     application.data_gateway._refresh_calendar = unavailable  # type: ignore[attr-defined]
     try:
         with pytest.raises(TaskOperationError, match="SYNC_CALENDAR_UNAVAILABLE"):
-            application.data_gateway.sync(
-                "akshare", date(2026, 8, 7), date(2026, 8, 7)
-            )
+            application.data_gateway.sync("akshare", date(2026, 8, 7), date(2026, 8, 7))
 
         assert application.data_gateway.latest_market_previews() == ()
         history = application.data_gateway.sync_history(1, 10).entries
@@ -331,9 +329,7 @@ def test_strategy_lab_runs_two_strategies_across_multiple_etfs(tmp_path: Path) -
         providers=(BacktestProvider(),),
         clock=lambda: NOW,
         id_factory=lambda kind: f"{kind}-{next(sequence)}",
-        expected_sessions=lambda request: pd.bdate_range(
-            request.start, request.end, name="date"
-        ),
+        expected_sessions=lambda request: pd.bdate_range(request.start, request.end, name="date"),
         sync_window=lambda today: (date(2026, 1, 2), date(2026, 8, 7)),
     )
     application.watchlists.save_primary(WatchlistDraft("关注标的", (INDEX, FIRST, SECOND)))
@@ -344,6 +340,7 @@ def test_strategy_lab_runs_two_strategies_across_multiple_etfs(tmp_path: Path) -
             "cross_sectional_momentum",
             "dual_ma",
             "etf_rotation",
+            "kronos_forecast",
             "mean_reversion",
             "rule_dsl",
         )
@@ -403,9 +400,7 @@ def test_strategy_lab_runs_two_strategies_across_multiple_etfs(tmp_path: Path) -
             FIRST,
             SECOND,
         }
-        assert report.snapshot.allocator_configuration["kind"] == (
-            "deterministic_multi_strategy"
-        )
+        assert report.snapshot.allocator_configuration["kind"] == ("deterministic_multi_strategy")
         assert tuple(item.sleeve_id for item in report.strategies) == (
             "strategy-hold",
             "strategy-trend",
@@ -430,9 +425,7 @@ def test_strategy_lab_runs_two_strategies_across_multiple_etfs(tmp_path: Path) -
         assert tuple(item.run_id for item in history) == ("backtest-test",)
         assert history[0].strategy_count == 2
         assert history[0].target_count == 2
-        compared = application.strategy_lab_gateway.compare_report(
-            "backtest-test", SECOND
-        )
+        compared = application.strategy_lab_gateway.compare_report("backtest-test", SECOND)
         assert compared.run_id == report.run_id
         assert compared.benchmark_curve
         assert application.strategy_lab_gateway.report("backtest-test") == report
@@ -451,9 +444,7 @@ def test_strategy_lab_runs_custom_rule_dsl_with_exported_variables(
         providers=(BacktestProvider(),),
         clock=lambda: NOW,
         id_factory=lambda kind: f"{kind}-{next(sequence)}",
-        expected_sessions=lambda request: pd.bdate_range(
-            request.start, request.end, name="date"
-        ),
+        expected_sessions=lambda request: pd.bdate_range(request.start, request.end, name="date"),
         sync_window=lambda today: (date(2026, 1, 2), date(2026, 8, 7)),
     )
     application.watchlists.save_primary(WatchlistDraft("关注标的", (INDEX, FIRST)))
@@ -495,9 +486,7 @@ def test_strategy_lab_runs_custom_rule_dsl_with_exported_variables(
         assert report is not None
         assert report.result.fills
         assert report.strategies[0].strategy_type == "rule_dsl"
-        assert report.strategies[0].parameters["buy_expression"] == (
-            "close > sma(close, window)"
-        )
+        assert report.strategies[0].parameters["buy_expression"] == ("close > sma(close, window)")
         assert report.strategies[0].parameters["variables"] == (
             {
                 "maximum": "20",
@@ -622,7 +611,9 @@ def test_failed_sync_is_released_and_does_not_block_the_next_task(tmp_path: Path
             (FIRST,),
         )
         assert second.task_id != first.task_id
-        assert application.task_manager.wait(second.task_id, timeout=5).status is TaskStatus.SUCCEEDED
+        assert (
+            application.task_manager.wait(second.task_id, timeout=5).status is TaskStatus.SUCCEEDED
+        )
     finally:
         application.shutdown()
 
@@ -779,9 +770,7 @@ def test_sync_preserves_signal_snapshot_manifests_and_quarantines_missing_histor
             minimum_trade_amount=Decimal("5000"),
         )
         assert decision.result.decision_equity != account.snapshot.equity
-        referenced_ids = {
-            reference.manifest_id for reference in decision.snapshot.market_manifests
-        }
+        referenced_ids = {reference.manifest_id for reference in decision.snapshot.market_manifests}
 
         current_bundle = application.data_gateway._bundles.latest()  # type: ignore[attr-defined]
         assert current_bundle is not None
@@ -914,9 +903,7 @@ def test_signal_decision_comparison_and_cleanup_use_the_frozen_account(
         providers=(BacktestProvider(),),
         clock=lambda: comparison_now,
         id_factory=lambda kind: f"{kind}-{next(sequence)}",
-        expected_sessions=lambda request: pd.bdate_range(
-            request.start, request.end, name="date"
-        ),
+        expected_sessions=lambda request: pd.bdate_range(request.start, request.end, name="date"),
         sync_window=lambda today: (date(2026, 8, 3), date(2026, 8, 7)),
     )
     application.watchlists.save_primary(WatchlistDraft("关注标的", (FIRST, SECOND)))
@@ -931,8 +918,7 @@ def test_signal_decision_comparison_and_cleanup_use_the_frozen_account(
                 frequency=StrategyFrequency.DAILY,
                 parameters=application.models.strategies.parameters_from_json(
                     "dual_ma",
-                    '{"short_window":2,"long_window":3,"confirmation_days":1,'
-                    '"target_weight":"1"}',
+                    '{"short_window":2,"long_window":3,"confirmation_days":1,"target_weight":"1"}',
                 ),
             )
         ).instance
@@ -990,8 +976,7 @@ def test_signal_center_shares_holdings_but_keeps_strategy_decisions_separate(
                 frequency=StrategyFrequency.DAILY,
                 parameters=application.models.strategies.parameters_from_json(
                     "dual_ma",
-                    '{"short_window":2,"long_window":3,"confirmation_days":1,'
-                    '"target_weight":"1"}',
+                    '{"short_window":2,"long_window":3,"confirmation_days":1,"target_weight":"1"}',
                 ),
             )
         ).instance
@@ -1039,9 +1024,7 @@ def test_signal_execution_updates_holdings_and_marks_prior_decision_stale(
         providers=(BacktestProvider(),),
         clock=lambda: NOW,
         id_factory=lambda kind: f"{kind}-{next(sequence)}",
-        expected_sessions=lambda request: pd.bdate_range(
-            request.start, request.end, name="date"
-        ),
+        expected_sessions=lambda request: pd.bdate_range(request.start, request.end, name="date"),
         sync_window=lambda today: (date(2026, 8, 3), date(2026, 8, 7)),
     )
     application.watchlists.save_primary(WatchlistDraft("关注标的", (FIRST, SECOND)))
@@ -1056,8 +1039,7 @@ def test_signal_execution_updates_holdings_and_marks_prior_decision_stale(
                 frequency=StrategyFrequency.DAILY,
                 parameters=application.models.strategies.parameters_from_json(
                     "dual_ma",
-                    '{"short_window":2,"long_window":3,"confirmation_days":1,'
-                    '"target_weight":"1"}',
+                    '{"short_window":2,"long_window":3,"confirmation_days":1,"target_weight":"1"}',
                 ),
             )
         ).instance
@@ -1121,9 +1103,7 @@ def test_signal_execution_updates_holdings_and_marks_prior_decision_stale(
             minimum_trade_amount=Decimal("2000"),
         )
         new_recommendation = next(
-            item
-            for item in new_decision.result.recommendations
-            if item.quantity_delta != 0
+            item for item in new_decision.result.recommendations if item.quantity_delta != 0
         )
         with pytest.raises(ValueError, match="SIGNAL_EXECUTION_INCOMPLETE"):
             application.signal_center.record_execution(

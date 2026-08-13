@@ -17,6 +17,31 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["hypothesis>=6", "mypy>=1.13", "pytest>=8", "pytest-cov>=6", "ruff>=0.9"]
+kronos = [
+  "kronos-model-arch==0.1.0",
+]
+kronos-cuda = [
+  "kronos-model-arch==0.1.0",
+  "torch>=2.13,<2.14; sys_platform != 'darwin'",
+]
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "kronos" },
+    { extra = "kronos-cuda" },
+  ],
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu132", extra = "kronos-cuda", marker = "sys_platform != 'darwin'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
 
 [build-system]
 requires = ["hatchling"]

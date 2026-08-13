@@ -55,11 +55,13 @@ from compass.storage.market_store import MarketStore
 from compass.storage.run_snapshot_repository import RunSnapshotRepository
 from compass.storage.signal_account_repository import SignalAccountRepository
 from compass.storage.signal_execution_repository import SignalExecutionRepository
+from compass.storage.strategy_draft_repository import StrategyDraftRepository
 from compass.strategies.buy_and_hold import BuyAndHoldStrategy
 from compass.strategies.dual_ma import DualMaStrategy
 from compass.strategies.etf_rotation import EtfRotationStrategy
 from compass.strategies.mean_reversion import MeanReversionStrategy
 from compass.strategies.momentum import CrossSectionalMomentumStrategy
+from compass.strategies.kronos_forecast import create_kronos_forecast_strategy
 from compass.strategies.registry import StrategyFactory, StrategyRegistry
 from compass.strategies.rule_dsl import RuleDslStrategy
 from compass.ui.pages.data import DataPageModel, DataSourceSnapshot
@@ -112,7 +114,11 @@ def _sync_window(today: date) -> tuple[date, date]:
 
 def _app_git_commit() -> str:
     configured = os.environ.get("COMPASS_GIT_COMMIT", "").strip().lower()
-    if configured and 7 <= len(configured) <= 64 and all(item in "0123456789abcdef" for item in configured):
+    if (
+        configured
+        and 7 <= len(configured) <= 64
+        and all(item in "0123456789abcdef" for item in configured)
+    ):
         return configured
     try:
         completed = subprocess.run(
@@ -429,21 +435,19 @@ def build_local_application(
             id_factory=id_factory,
         )
         strategy_registry = StrategyRegistry()
-        strategy_registry.register(
-            "buy_and_hold", cast(StrategyFactory, BuyAndHoldStrategy)
-        )
+        strategy_registry.register("buy_and_hold", cast(StrategyFactory, BuyAndHoldStrategy))
         strategy_registry.register(
             "cross_sectional_momentum",
             cast(StrategyFactory, CrossSectionalMomentumStrategy),
         )
         strategy_registry.register("dual_ma", cast(StrategyFactory, DualMaStrategy))
-        strategy_registry.register(
-            "etf_rotation", cast(StrategyFactory, EtfRotationStrategy)
-        )
-        strategy_registry.register(
-            "mean_reversion", cast(StrategyFactory, MeanReversionStrategy)
-        )
+        strategy_registry.register("etf_rotation", cast(StrategyFactory, EtfRotationStrategy))
+        strategy_registry.register("mean_reversion", cast(StrategyFactory, MeanReversionStrategy))
         strategy_registry.register("rule_dsl", cast(StrategyFactory, RuleDslStrategy))
+        strategy_registry.register(
+            "kronos_forecast",
+            cast(StrategyFactory, create_kronos_forecast_strategy),
+        )
         provider_configuration = _provider_configuration(configured_providers)
         proxy_environment = _MarketProxyEnvironment()
         settings_gateway = LocalSettingsGateway(
@@ -516,9 +520,7 @@ def build_local_application(
         )
         reports = BacktestReportRepository(database, snapshots, clock=clock)
         accounts = AccountRepository(database, "main", clock)
-        signal_accounts = SignalAccountRepository(
-            settings.root / "data" / "signal_accounts.json"
-        )
+        signal_accounts = SignalAccountRepository(settings.root / "data" / "signal_accounts.json")
         signal_executions = SignalExecutionRepository(
             settings.root / "data" / "signal_executions.json"
         )
@@ -570,6 +572,24 @@ def build_local_application(
             clock=clock,
             id_factory=id_factory,
         )
+        strategy_drafts = StrategyDraftRepository(settings.root / "data" / "strategy-drafts.json")
+
+        def preview_bars(instrument: InstrumentId) -> pd.DataFrame:
+            bundle = bundles.latest()
+            if bundle is None or instrument not in bundle.instruments:
+                raise LookupError("STRATEGY_PREVIEW_DATA_UNAVAILABLE")
+            reference = next(
+                (
+                    item
+                    for item in bundle.market_manifests
+                    if InstrumentId.parse(market_store.load_manifest(item.manifest_id).instrument)
+                    == instrument
+                ),
+                None,
+            )
+            if reference is None:
+                raise LookupError("STRATEGY_PREVIEW_DATA_UNAVAILABLE")
+            return market_store.read_manifest(reference.manifest_id)
 
         from compass.ui.app import AppViewModels
         from compass.ui.pages.account_overview import AccountOverviewPageModel
@@ -582,9 +602,7 @@ def build_local_application(
             scheduler=scheduler,
             clock=clock,
             latest_completed_session=(
-                exchange_calendar.latest_completed_session
-                if expected_sessions is None
-                else None
+                exchange_calendar.latest_completed_session if expected_sessions is None else None
             ),
         )
 
@@ -613,6 +631,9 @@ def build_local_application(
                 strategies,
                 tasks,
                 optimizer=strategy_optimizer,
+                drafts=strategy_drafts,
+                preview_reader=preview_bars,
+                clock=clock,
             ),
             backtests=StrategyLabPageModel(strategy_lab_gateway, tasks),
             account=AccountOverviewPageModel(signal_center),

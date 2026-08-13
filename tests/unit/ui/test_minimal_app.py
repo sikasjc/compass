@@ -59,6 +59,10 @@ def test_application_exposes_market_data_and_strategy_pages() -> None:
         "/watchlists",
         "/settings",
         "/logs",
+        "/strategies/editor",
+        "/strategies/preview",
+        "/strategies/release",
+        "/strategies/templates",
     )
     registered: list[str] = []
 

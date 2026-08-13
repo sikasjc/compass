@@ -16,6 +16,7 @@ Compass 是一个仅在本机运行的 A 股量化研究工具，覆盖标的池
 - 创建和版本化策略模板；
 - 组合多个策略和多个 ETF 进行回测，并比较基准；
 - 使用训练、验证和冻结测试区间进行策略参数调优；
+- 可选接入 Kronos K 线基础模型，将价格预测转换为可回测目标仓位；
 - 查看本地脱敏日志，排查代理、网络和行情源问题。
 
 ## 系统要求
@@ -65,6 +66,54 @@ cd compass
 uv sync --extra dev
 ```
 
+### 可选：安装 Kronos 模型策略
+
+Kronos 不是 Compass 基础安装的必需依赖。CPU 或 macOS 环境运行：
+
+```bash
+uv sync --extra kronos
+```
+
+Windows/Linux NVIDIA GPU 环境运行：
+
+```bash
+uv sync --extra kronos-cuda
+```
+
+Windows 推荐使用自检脚本；代理只作用于本次安装，不修改系统设置：
+
+```powershell
+.\scripts\install-kronos.ps1 -Mode CUDA -Proxy http://127.0.0.1:7897 -IncludeDev
+```
+
+脚本会依次检查 `uv`、NVIDIA 驱动，安装依赖，然后输出 PyTorch 版本、CUDA
+运行时、GPU 可用状态和设备名称。下载中断后可直接重跑同一命令复用缓存。
+
+两个选项互斥，切换时直接执行对应命令即可。`kronos-cuda` 从 PyTorch 官方 CUDA 13.2
+索引安装 GPU 版本；NVIDIA 驱动必须兼容该运行时，不需要单独安装完整 CUDA Toolkit。
+可用下面的命令检查结果：
+
+```bash
+uv run python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+最后一项为 `True` 即表示 Compass 的“自动”推理设备会选择 NVIDIA GPU；否则页面会明确显示
+“当前仅 CPU”。
+
+首次运行该策略会从 Hugging Face 下载模型权重。默认使用
+`NeoQuasar/Kronos-mini` 和 `NeoQuasar/Kronos-Tokenizer-2k`；模型缓存由 Hugging Face
+管理，不写入 Git 仓库。需要更高容量时可在策略参数中选择 `small` 或 `base`。Kronos
+代码及模型采用 MIT 许可，但模型输出仅作为实验信号，不能视为收益保证。
+
+如果 `huggingface.co` 在当前网络不稳定，可在个人 `.env` 中设置：
+
+```text
+HF_ENDPOINT=https://hf-mirror.com
+```
+
+模型默认缓存在 `~/.cache/huggingface`；可用 `HF_HOME` 改到空间更充足的磁盘。
+Windows 没有开启开发者模式时缓存仍可用，只是无法用符号链接去重。
+
 首次提交代码前建议运行：
 
 ```bash
@@ -81,7 +130,8 @@ uv run pytest -q
 uv run python -m compass.ui.app
 ```
 
-也可以使用启动脚本；脚本会同步依赖并读取仓库根目录下未跟踪的 `.env`：
+也可以使用启动脚本；脚本会以非清理模式同步基础依赖、保留已经安装的 Kronos
+CPU/CUDA 可选环境，并读取仓库根目录下未跟踪的 `.env`：
 
 ```powershell
 # Windows PowerShell
@@ -134,10 +184,12 @@ lsof -iTCP:8080 -sTCP:LISTEN
 ```bash
 cd <Compass 仓库目录>
 git pull
-uv sync --extra dev
+uv sync --extra dev --inexact
 ```
 
-只作为普通用户运行时，可以把最后一条改为 `uv sync`。
+只作为普通用户运行时，可以把最后一条改为 `uv sync --inexact`。`--inexact` 会保留
+已经单独安装的 Kronos CPU/CUDA 环境；如果希望严格重建环境，则明确运行
+`uv sync --extra kronos` 或 `uv sync --extra kronos-cuda`。
 
 更新后重新启动应用。数据库结构由应用启动时自动检查和创建；重要更新前仍建议备份运行数据目录。
 
@@ -233,6 +285,7 @@ C:\Users\<用户名>\AppData\Local\Compass
 │  ├─ market                       # 行情对象、清单和交易日历
 │  ├─ signal_accounts.json         # 信号账户方案
 │  ├─ signal_executions.json       # 建议采用与执行记录
+│  ├─ strategy-drafts.json         # 未发布的自定义规则草稿
 │  └─ strategy_optimizations.json  # 策略调优实验
 ├─ reports                         # 导出或生成的报告
 └─ logs
@@ -251,6 +304,8 @@ C:\Users\<用户名>\AppData\Local\Compass
 不要只复制 SQLite 文件：行情对象和部分账户、信号、实验记录保存在同一根目录的其他文件中。
 
 ## 基本使用流程
+
+面向日常操作的完整页面说明见 [`docs/user-guide.md`](docs/user-guide.md)。
 
 1. 打开根地址 `/`，从“开始”页面进入功能；
 2. 在“标的池”添加关注的指数或 ETF；

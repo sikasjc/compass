@@ -23,7 +23,8 @@ if ! command -v "$UV_COMMAND" >/dev/null 2>&1; then
 fi
 
 cd "$REPOSITORY_ROOT"
-"$UV_COMMAND" sync
+# Preserve explicitly installed optional environments such as Kronos CPU/CUDA.
+"$UV_COMMAND" sync --inexact
 
 if [ -f "$ENVIRONMENT_FILE" ]; then
     exec "$UV_COMMAND" run --env-file "$ENVIRONMENT_FILE" \

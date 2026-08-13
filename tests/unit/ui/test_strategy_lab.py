@@ -20,6 +20,7 @@ from compass.ui.pages.strategy_lab import (
     StrategyLabTemplate,
     StrategyLegConfiguration,
 )
+from compass.strategies.kronos_forecast import KronosForecastParameters
 
 
 INSTRUMENT = InstrumentId.parse("SSE.510300")
@@ -71,9 +72,7 @@ def test_strategy_configuration_validates_initial_positions_and_cash_weight() ->
     configured = replace(
         configuration(),
         initial_cash_weight=Decimal("0.4"),
-        initial_positions=(
-            StrategyLabInitialPosition(INSTRUMENT, Decimal("0.6")),
-        ),
+        initial_positions=(StrategyLabInitialPosition(INSTRUMENT, Decimal("0.6")),),
     )
     assert configured.initial_positions[0].instrument == INSTRUMENT
 
@@ -94,6 +93,27 @@ def test_strategy_experiment_validates_rebalance_controls() -> None:
         replace(configured, rebalance_drift=Decimal("0.30"))
     with pytest.raises(ValueError, match="minimum_trade_amount"):
         replace(configured, minimum_trade_amount=Decimal("-1"))
+
+
+def test_kronos_strategy_leg_requires_and_preserves_model_parameters() -> None:
+    with pytest.raises(ValueError, match="Kronos parameters"):
+        StrategyLegConfiguration(
+            strategy_id="strategy-kronos",
+            strategy=StrategyLabKind.KRONOS_FORECAST,
+            instruments=(INSTRUMENT,),
+            budget=Decimal("1"),
+        )
+
+    parameters = KronosForecastParameters(model_size="mini", lookback=64)
+    configured = StrategyLegConfiguration(
+        strategy_id="strategy-kronos",
+        strategy=StrategyLabKind.KRONOS_FORECAST,
+        instruments=(INSTRUMENT,),
+        budget=Decimal("1"),
+        kronos_parameters=parameters,
+    )
+
+    assert configured.kronos_parameters == parameters
 
 
 class Gateway:

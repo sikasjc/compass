@@ -128,7 +128,7 @@ def test_launcher_runs_from_any_cwd_and_propagates_application_exit(
     assert completed.returncode == 23
     assert lines == [
         f"{ROOT}|--version",
-        f"{ROOT}|sync",
+        f"{ROOT}|sync --inexact",
         f"{ROOT}|{IDENTITY_COMMAND}",
         f"{ROOT}|run python -m compass.ui.app --port 8080",
     ]
@@ -154,7 +154,7 @@ def test_launcher_stops_after_uv_sync_failure_and_propagates_exit(tmp_path: Path
     completed, lines = _run(tmp_path, sync_exit=19)
 
     assert completed.returncode == 19
-    assert lines == [f"{ROOT}|--version", f"{ROOT}|sync"]
+    assert lines == [f"{ROOT}|--version", f"{ROOT}|sync --inexact"]
     assert "依赖同步失败" in completed.stderr
     assert SENTINEL not in completed.stderr
 
@@ -165,7 +165,7 @@ def test_launcher_accepts_successful_uv_sync_progress_on_stderr(tmp_path: Path) 
     assert completed.returncode == 0
     assert lines == [
         f"{ROOT}|--version",
-        f"{ROOT}|sync",
+        f"{ROOT}|sync --inexact",
         f"{ROOT}|{IDENTITY_COMMAND}",
         f"{ROOT}|run python -m compass.ui.app --port 8080",
     ]
@@ -182,7 +182,7 @@ def test_launcher_passes_untracked_dotenv_to_uv_without_echoing_it(tmp_path: Pat
     assert completed.returncode == 0
     assert lines == [
         f"{ROOT}|--version",
-        f"{ROOT}|sync",
+        f"{ROOT}|sync --inexact",
         f"{ROOT}|{IDENTITY_COMMAND}",
         f"{ROOT}|run --env-file {environment_file} python -m compass.ui.app --port 8080",
     ]
@@ -217,7 +217,7 @@ def test_launcher_uses_uv_managed_cpython_when_python_is_not_on_path(
     assert completed.returncode == 0
     assert lines == [
         f"{ROOT}|--version",
-        f"{ROOT}|sync",
+        f"{ROOT}|sync --inexact",
         f"{ROOT}|{IDENTITY_COMMAND}",
         f"{ROOT}|run python -m compass.ui.app --port 8080",
     ]

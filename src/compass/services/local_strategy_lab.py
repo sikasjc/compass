@@ -40,6 +40,7 @@ from compass.storage.dataset_bundle_repository import DatasetBundleRepository
 from compass.strategies.base import StrategyContext
 from compass.strategies.dual_ma import DualMaParameters
 from compass.strategies.indicators import simple_moving_average
+from compass.strategies.kronos_forecast import KronosForecastStrategy
 from compass.strategies.rule_dsl import (
     RuleDslParameters,
     compile_rule,
@@ -79,11 +80,7 @@ def _materialize_initial_positions(
     invested = Decimal("0")
     for requested in configuration.initial_positions:
         frame = bars[requested.instrument]
-        matching = [
-            timestamp
-            for timestamp in frame.index
-            if timestamp.date() == first_session
-        ]
+        matching = [timestamp for timestamp in frame.index if timestamp.date() == first_session]
         if not matching:
             raise LookupError("BACKTEST_INITIAL_POSITION_PRICE_MISSING")
         raw_price = frame.loc[matching[0], "open"]
@@ -125,7 +122,11 @@ class _CombinedStrategyDecisionSource:
         self._last_requested_weights: Mapping[str, Decimal] | None = None
         target_instruments = tuple(
             sorted(
-                {instrument for strategy in self._strategies for instrument in strategy.instruments},
+                {
+                    instrument
+                    for strategy in self._strategies
+                    for instrument in strategy.instruments
+                },
                 key=str,
             )
         )
@@ -160,6 +161,14 @@ class _CombinedStrategyDecisionSource:
             )
             for strategy_id, parameters in self._rule_parameters.items()
         }
+        self._kronos_strategies = {
+            strategy.strategy_id: KronosForecastStrategy(
+                strategy.kronos_parameters,
+                strategy.strategy_id,
+            )
+            for strategy in self._strategies
+            if strategy.strategy is StrategyLabKind.KRONOS_FORECAST
+        }
         self._allocator = DeterministicAllocator()
         self._policy = AllocationPolicy(
             strategy_budgets={
@@ -182,8 +191,7 @@ class _CombinedStrategyDecisionSource:
                 dsl_parameters.variable_values,
             )
             held = any(
-                (holding := context.holding(instrument)) is not None
-                and holding.quantity > 0
+                (holding := context.holding(instrument)) is not None and holding.quantity > 0
                 for instrument in strategy.instruments
             )
             if len(history) < needed:
@@ -194,16 +202,16 @@ class _CombinedStrategyDecisionSource:
             return buy.evaluate(history, dsl_parameters.variable_values) or held
         ma_parameters = self._parameters[strategy.strategy_id]
         close = context.history(strategy.signal_instrument)["close"]
-        required_history = (
-            ma_parameters.long_window + ma_parameters.confirmation_days - 1
-        )
+        required_history = ma_parameters.long_window + ma_parameters.confirmation_days - 1
         if len(close) < required_history:
             return False
         short = simple_moving_average(close, ma_parameters.short_window)
         long = simple_moving_average(close, ma_parameters.long_window)
         spread = short - long
         recent = spread.iloc[-ma_parameters.confirmation_days :]
-        return not recent.isna().any() and isfinite(float(long.iloc[-1])) and bool((recent > 0).all())
+        return (
+            not recent.isna().any() and isfinite(float(long.iloc[-1])) and bool((recent > 0).all())
+        )
 
     def _is_rebalance_session(self, context: StrategyContext) -> bool:
         if self._last_requested_weights is None:
@@ -235,8 +243,7 @@ class _CombinedStrategyDecisionSource:
             sleeves[symbol] = {
                 strategy_id: sleeve.final_weights[symbol_text]
                 for strategy_id, sleeve in target.sleeves.items()
-                if symbol_text in sleeve.final_weights
-                and sleeve.final_weights[symbol_text] > 0
+                if symbol_text in sleeve.final_weights and sleeve.final_weights[symbol_text] > 0
             }
         return DecisionTarget(weights, sleeves)
 
@@ -247,9 +254,7 @@ class _CombinedStrategyDecisionSource:
         for instrument in set(target.weights) | set(context.holdings):
             holding = context.holding(instrument)
             current_value = (
-                Decimal("0")
-                if holding is None
-                else holding.mark_price * holding.quantity
+                Decimal("0") if holding is None else holding.mark_price * holding.quantity
             )
             current_units = (
                 0
@@ -267,13 +272,41 @@ class _CombinedStrategyDecisionSource:
                 or trade_amount < self._minimum_trade_amount
             ):
                 adjusted[instrument] = current_weight
-        if sum((weight_to_units(item, label="adjusted target") for item in adjusted.values())) > WEIGHT_SCALE:
+        if (
+            sum((weight_to_units(item, label="adjusted target") for item in adjusted.values()))
+            > WEIGHT_SCALE
+        ):
             return target
         return DecisionTarget(adjusted, target.sleeve_weights)
 
     def targets(self, context: StrategyContext) -> DecisionTarget:
         intents: list[TargetIntent] = []
         for strategy in self._strategies:
+            if strategy.strategy is StrategyLabKind.KRONOS_FORECAST:
+                kronos_context = StrategyContext(
+                    as_of=context.as_of,
+                    bars={
+                        instrument: context.history(instrument)
+                        for instrument in strategy.instruments
+                    },
+                    instruments=strategy.instruments,
+                    account_equity=context.account_equity,
+                    cash=context.cash,
+                    holdings={
+                        instrument: holding
+                        for instrument, holding in context.holdings.items()
+                        if instrument in strategy.instruments
+                    },
+                    asset_types={
+                        instrument: context.asset_types[instrument]
+                        for instrument in strategy.instruments
+                    },
+                )
+                decision = self._kronos_strategies[strategy.strategy_id].generate_targets(
+                    kronos_context
+                )
+                intents.extend(decision.intents)
+                continue
             active = self._active(strategy, context)
             for instrument, weight in self._weights[strategy.strategy_id].items():
                 intents.append(
@@ -326,9 +359,7 @@ class LocalStrategyLabGateway:
         self._app_git_commit = app_git_commit
         self._id_factory = id_factory
         self._instrument_cache: tuple[str, tuple[StrategyLabInstrument, ...]] | None = None
-        self._comparison_cache: dict[
-            tuple[str, InstrumentId, str], BacktestReport
-        ] = {}
+        self._comparison_cache: dict[tuple[str, InstrumentId, str], BacktestReport] = {}
         self._history_cache: tuple[StrategyLabHistoryEntry, ...] | None = None
 
     def templates(self) -> tuple[StrategyLabTemplate, ...]:
@@ -389,9 +420,7 @@ class LocalStrategyLabGateway:
     def report(self, run_id: str) -> BacktestReport | None:
         return self._reports.get(run_id)
 
-    def compare_report(
-        self, run_id: str, benchmark: InstrumentId
-    ) -> BacktestReport:
+    def compare_report(self, run_id: str, benchmark: InstrumentId) -> BacktestReport:
         if type(benchmark) is not InstrumentId:
             raise TypeError("benchmark must be an exact InstrumentId")
         bundle = self._bundles.latest()
@@ -456,9 +485,7 @@ class LocalStrategyLabGateway:
         if deleted:
             self._history_cache = None
             self._comparison_cache = {
-                key: value
-                for key, value in self._comparison_cache.items()
-                if key[0] != run_id
+                key: value for key, value in self._comparison_cache.items() if key[0] != run_id
             }
         return deleted
 
@@ -495,9 +522,7 @@ class LocalStrategyLabGateway:
             for strategy in configuration.strategies
             if strategy.signal_instrument is not None
         }
-        initial_position_instruments = {
-            item.instrument for item in configuration.initial_positions
-        }
+        initial_position_instruments = {item.instrument for item in configuration.initial_positions}
         strategy_instruments = tuple(
             sorted(
                 trade_instruments | signal_instruments | initial_position_instruments,
@@ -517,8 +542,7 @@ class LocalStrategyLabGateway:
             sorted((references[item] for item in selected), key=lambda item: item.manifest_id)
         )
         selected_manifests = tuple(
-            self._bundles.load_manifest(reference.manifest_id)
-            for reference in selected_references
+            self._bundles.load_manifest(reference.manifest_id) for reference in selected_references
         )
         provenance = validate_dataset_provenance(
             selected_manifests,
@@ -527,9 +551,7 @@ class LocalStrategyLabGateway:
             allow_quality_gaps=bundle.data_quality["mode"] == "degraded",
         )
         sessions = tuple(
-            day
-            for day in provenance.sessions
-            if configuration.start <= day <= configuration.end
+            day for day in provenance.sessions if configuration.start <= day <= configuration.end
         )
         if len(sessions) < 2:
             raise LookupError("BACKTEST_SESSIONS_MISSING")
@@ -595,6 +617,8 @@ class LocalStrategyLabGateway:
                         "1.1.0"
                         if strategy.strategy is StrategyLabKind.DUAL_MA
                         else "1.0.0"
+                        if strategy.strategy is StrategyLabKind.KRONOS_FORECAST
+                        else "1.0.0"
                     ),
                     parameters={
                         "budget": strategy.budget,
@@ -603,17 +627,19 @@ class LocalStrategyLabGateway:
                             if strategy.signal_instrument is None
                             else str(strategy.signal_instrument)
                         ),
-                        "trade_instruments": tuple(
-                            str(item) for item in strategy.instruments
-                        ),
+                        "trade_instruments": tuple(str(item) for item in strategy.instruments),
                         "short_window": strategy.short_window,
                         "long_window": strategy.long_window,
                         "confirmation_days": strategy.confirmation_days,
                         "buy_expression": strategy.buy_expression,
                         "sell_expression": strategy.sell_expression,
                         "variables": tuple(
-                            item.model_dump(mode="json")
-                            for item in strategy.variables
+                            item.model_dump(mode="json") for item in strategy.variables
+                        ),
+                        "kronos_parameters": (
+                            None
+                            if strategy.kronos_parameters is None
+                            else strategy.kronos_parameters.model_dump(mode="json")
                         ),
                         "template_instance_id": strategy.template_instance_id,
                         "template_name": strategy.template_name,
@@ -623,8 +649,12 @@ class LocalStrategyLabGateway:
             ),
             instrument_pool={
                 "instruments": tuple(str(item) for item in strategy_instruments),
-                "signal_instruments": tuple(str(item) for item in sorted(signal_instruments, key=str)),
-                "trade_instruments": tuple(str(item) for item in sorted(trade_instruments, key=str)),
+                "signal_instruments": tuple(
+                    str(item) for item in sorted(signal_instruments, key=str)
+                ),
+                "trade_instruments": tuple(
+                    str(item) for item in sorted(trade_instruments, key=str)
+                ),
                 "initial_positions": tuple(
                     {
                         "instrument": str(item.instrument),
@@ -644,8 +674,7 @@ class LocalStrategyLabGateway:
                 "rebalance_drift": configuration.rebalance_drift,
                 "minimum_trade_amount": configuration.minimum_trade_amount,
                 "strategy_budgets": {
-                    strategy.strategy_id: strategy.budget
-                    for strategy in configuration.strategies
+                    strategy.strategy_id: strategy.budget for strategy in configuration.strategies
                 },
                 "asset_class_budgets": {AssetType.ETF.value: Decimal("1")},
                 "cash_reserve": Decimal("0"),

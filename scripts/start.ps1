@@ -70,7 +70,9 @@ try {
     # converts redirected native stderr into error records, so trust the process
     # exit code instead of treating that stream as a terminating exception.
     $ErrorActionPreference = "Continue"
-    & $UvCommand sync *> $null
+    # Keep optional environments such as Kronos CPU/CUDA that were installed
+    # explicitly. A default exact sync would remove extras not named here.
+    & $UvCommand sync --inexact *> $null
     $SyncExit = $LASTEXITCODE
 }
 catch {

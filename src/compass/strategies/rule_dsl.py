@@ -5,7 +5,7 @@ from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from math import isfinite
 import re
-from typing import cast
+from typing import Literal, cast
 
 import pandas as pd  # type: ignore[import-untyped]
 from pydantic import Field, field_validator, model_validator
@@ -41,8 +41,8 @@ _FUNCTION_ARITY = {
     "sma": 2,
 }
 _RESERVED = _FIELDS | frozenset(_FUNCTION_ARITY)
-_MAX_EXPRESSION_LENGTH = 512
-_MAX_AST_NODES = 96
+_MAX_EXPRESSION_LENGTH = 2_048
+_MAX_AST_NODES = 384
 _MAX_WINDOW = 10_000
 
 
@@ -99,6 +99,10 @@ class RuleDslParameters(StrategyParameters):
         le=1,
         description="策略袖套内所有持仓标的的合计目标权重。",
     )
+    execution: Literal["next_open", "next_close"] = Field(
+        default="next_open",
+        description="信号在收盘确认后计划采用的执行时点。",
+    )
 
     @model_validator(mode="after")
     def validate_program(self) -> RuleDslParameters:
@@ -136,6 +140,10 @@ class RuleDslProgram:
         _validate_node(parsed.body, self._variables)
         self._root = parsed.body
 
+    @property
+    def referenced_fields(self) -> frozenset[str]:
+        return frozenset(_referenced_fields(self._root))
+
     def evaluate(
         self,
         frame: pd.DataFrame,
@@ -143,7 +151,7 @@ class RuleDslProgram:
     ) -> bool:
         if not isinstance(frame, pd.DataFrame) or frame.empty:
             return False
-        missing = (_referenced_fields(self._root) - set(frame.columns))
+        missing = _referenced_fields(self._root) - set(frame.columns)
         if missing:
             raise ValueError("DSL_REQUIRED_FIELD_MISSING")
         values = {name: _finite_number(value) for name, value in variables.items()}
@@ -159,9 +167,7 @@ def compile_rule(expression: str, variables: Sequence[str]) -> RuleDslProgram:
         raise ValueError("DSL_EXPRESSION_TOO_LONG")
     checked_variables = tuple(variables)
     if any(
-        type(item) is not str
-        or not _IDENTIFIER.fullmatch(item)
-        or item in _RESERVED
+        type(item) is not str or not _IDENTIFIER.fullmatch(item) or item in _RESERVED
         for item in checked_variables
     ):
         raise ValueError("DSL_VARIABLE_NAME_INVALID")
@@ -170,9 +176,7 @@ def compile_rule(expression: str, variables: Sequence[str]) -> RuleDslProgram:
     return RuleDslProgram(expression, checked_variables)
 
 
-def required_history(
-    expressions: Sequence[str], variables: Mapping[str, Decimal]
-) -> int:
+def required_history(expressions: Sequence[str], variables: Mapping[str, Decimal]) -> int:
     maximum = 2
     names = tuple(variables)
     for expression in expressions:
@@ -215,8 +219,10 @@ def _validate_node(node: ast.AST, variables: frozenset[str]) -> None:
         _validate_node(node.right, variables)
         return
     if isinstance(node, ast.Compare):
-        if len(node.ops) != 1 or len(node.comparators) != 1 or not isinstance(
-            node.ops[0], (ast.Gt, ast.GtE, ast.Lt, ast.LtE, ast.Eq, ast.NotEq)
+        if (
+            len(node.ops) != 1
+            or len(node.comparators) != 1
+            or not isinstance(node.ops[0], (ast.Gt, ast.GtE, ast.Lt, ast.LtE, ast.Eq, ast.NotEq))
         ):
             raise ValueError("DSL_COMPARISON_INVALID")
         _validate_node(node.left, variables)
@@ -380,11 +386,7 @@ def _both_finite(left: object, right: object) -> bool:
 
 
 def _referenced_fields(node: ast.AST) -> set[str]:
-    return {
-        item.id
-        for item in ast.walk(node)
-        if isinstance(item, ast.Name) and item.id in _FIELDS
-    }
+    return {item.id for item in ast.walk(node) if isinstance(item, ast.Name) and item.id in _FIELDS}
 
 
 class RuleDslStrategy:
@@ -490,8 +492,7 @@ class RuleDslStrategy:
                 "active_count": active_count,
                 "required_history": self.required_history,
                 "variables": {
-                    name: str(value)
-                    for name, value in self.parameters.variable_values.items()
+                    name: str(value) for name, value in self.parameters.variable_values.items()
                 },
             },
         )

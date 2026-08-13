@@ -18,11 +18,18 @@ from compass.ui.pages.account_overview import (
 )
 from compass.ui.pages.data import DataPageModel, render_data_page
 from compass.ui.pages.logs import LogsPageModel, render_logs_page
+from compass.ui.pages.rule_editor import (
+    render_rule_editor_page,
+    render_rule_preview_page,
+    render_rule_release_page,
+    render_strategy_library_page,
+    render_strategy_templates_page,
+)
 from compass.ui.pages.home import render_start_page
 from compass.ui.pages.settings import SettingsPageModel, render_settings_page
 from compass.ui.pages.signals import SignalPageModel, render_signals_page
 from compass.ui.pages.strategy_lab import StrategyLabPageModel, render_strategy_lab_page
-from compass.ui.pages.strategies import StrategyPageModel, render_strategies_page
+from compass.ui.pages.strategies import StrategyPageModel
 from compass.ui.pages.watchlists import WatchlistPageModel, render_watchlists_page
 
 
@@ -38,7 +45,12 @@ NAV_ITEMS = (
     NavigationItem("设置", "/settings", "settings"),
     NavigationItem("日志", "/logs", "article"),
 )
-ROUTES = tuple(item.route for item in NAV_ITEMS)
+ROUTES = tuple(item.route for item in NAV_ITEMS) + (
+    "/strategies/editor",
+    "/strategies/preview",
+    "/strategies/release",
+    "/strategies/templates",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,7 +139,23 @@ def register_pages(
 
     def strategy_lab() -> None:
         with page_shell("策略实验室", "创建、解释并管理可复用的策略定义", NAV_ITEMS):
-            render_strategies_page(models.strategies)
+            render_strategy_library_page(models.strategies)
+
+    def rule_editor() -> None:
+        with page_shell("规则编辑器", "使用规则与变量创建安全、可复现的策略草稿", NAV_ITEMS):
+            render_rule_editor_page(models.strategies)
+
+    def rule_preview() -> None:
+        with page_shell("信号预览", "检查规则何时命中以及目标仓位如何变化", NAV_ITEMS):
+            render_rule_preview_page(models.strategies)
+
+    def rule_release() -> None:
+        with page_shell("验证与发布", "检查执行语义并发布不可变策略版本", NAV_ITEMS):
+            render_rule_release_page(models.strategies)
+
+    def strategy_templates() -> None:
+        with page_shell("内置模板与参数调优", "创建经典策略或运行参数实验", NAV_ITEMS):
+            render_strategy_templates_page(models.strategies)
 
     def backtests() -> None:
         with page_shell("策略回测", "配置组合与账户参数，运行回测并查看结果", NAV_ITEMS):
@@ -153,11 +181,22 @@ def register_pages(
         with page_shell("日志", "查看应用与行情请求的本地脱敏日志", NAV_ITEMS):
             render_logs_page(models.logs)
 
-    for route, handler in zip(
-        ROUTES,
-        (home, signals, account, backtests, strategy_lab, data, watchlists, settings, logs),
-        strict=True,
-    ):
+    handlers = (
+        home,
+        signals,
+        account,
+        backtests,
+        strategy_lab,
+        data,
+        watchlists,
+        settings,
+        logs,
+        rule_editor,
+        rule_preview,
+        rule_release,
+        strategy_templates,
+    )
+    for route, handler in zip(ROUTES, handlers, strict=True):
         register(route)(handler)
 
 
