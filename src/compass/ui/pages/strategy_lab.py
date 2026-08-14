@@ -268,6 +268,7 @@ class StrategyLabHistoryEntry:
     has_report: bool
     task_id: str | None = None
     failure_code: str | None = None
+    failure_error_id: str | None = None
 
     def __post_init__(self) -> None:
         safe_identifier(self.run_id, label="backtest run id")
@@ -294,6 +295,8 @@ class StrategyLabHistoryEntry:
             safe_identifier(self.task_id, label="backtest task id")
         if self.failure_code is not None:
             stable_code(self.failure_code, label="backtest failure code")
+        if self.failure_error_id is not None:
+            safe_identifier(self.failure_error_id, label="backtest failure error id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -444,6 +447,7 @@ class StrategyLabPageModel:
                 has_report=existing is not None and existing.has_report,
                 task_id=task.task_id,
                 failure_code=None if task.failure is None else task.failure.code,
+                failure_error_id=None if task.failure is None else task.failure.error_id,
             )
         ordered = tuple(
             sorted(
@@ -974,8 +978,19 @@ def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
 
         def reset_range() -> None:
             selected_items = [by_id[item] for item in selected_instrument_ids()]
-            start_input.value = max(item.first_day for item in selected_items).isoformat()
-            end_input.value = min(item.last_day for item in selected_items).isoformat()
+            available_start = max(item.first_day for item in selected_items)
+            available_end = min(item.last_day for item in selected_items)
+            try:
+                requested_start = date.fromisoformat(str(start_input.value))
+                requested_end = date.fromisoformat(str(end_input.value))
+            except ValueError:
+                requested_start, requested_end = available_start, available_end
+            clamped_start = max(requested_start, available_start)
+            clamped_end = min(requested_end, available_end)
+            if clamped_start >= clamped_end:
+                clamped_start, clamped_end = available_start, available_end
+            start_input.value = clamped_start.isoformat()
+            end_input.value = clamped_end.isoformat()
 
         def refresh_readiness() -> None:
             budget = sum((item.budget for item in configured_strategies), Decimal("0"))
@@ -1612,7 +1627,10 @@ def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
                             details.append(f"{item.target_count} 个 ETF")
                         ui.label(" · ".join(details)).classes("text-sm text-slate-600")
                         if item.failure_code is not None:
-                            ui.label(f"错误：{item.failure_code}").classes("text-xs text-red-700")
+                            failure = f"错误：{item.failure_code}"
+                            if item.failure_error_id is not None:
+                                failure += f" · 错误 ID：{item.failure_error_id}"
+                            ui.label(failure).classes("text-xs text-red-700")
                     view_button = ui.button(
                         "查看结果",
                         on_click=lambda _, run_id=item.run_id: view_report(run_id),

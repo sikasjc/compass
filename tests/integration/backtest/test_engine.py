@@ -145,6 +145,49 @@ def test_close_signal_can_be_configured_to_fill_at_next_close() -> None:
     assert result.fills[0].price != _bars().iloc[1]["open"]
 
 
+def test_execution_accepts_provider_float_noise_around_integer_volume() -> None:
+    bars = _bars()
+    bars["volume"] = bars["volume"].astype(float)
+    bars.loc[pd.Timestamp("2026-07-20"), "volume"] = 99_999.99999999999
+    request = BacktestRequest(
+        run_id="float-volume-noise",
+        sessions=(date(2026, 7, 20), date(2026, 7, 21)),
+        instruments={SYMBOL: INSTRUMENT},
+        bars={SYMBOL: bars},
+        initial_cash=Decimal("1000"),
+        initial_positions=(),
+        corporate_actions=(),
+        decision_source=_AssertingSource({date(2026, 7, 20): Decimal("1")}),
+        risk_engine=RiskEngine(()),
+        rule_book=MarketRuleBook((_profile(),)),
+    )
+
+    result = BacktestEngine().run(request)
+
+    assert result.fills
+
+
+def test_execution_rejects_genuinely_fractional_volume() -> None:
+    bars = _bars()
+    bars["volume"] = bars["volume"].astype(float)
+    bars.loc[pd.Timestamp("2026-07-20"), "volume"] = 99_999.5
+    request = BacktestRequest(
+        run_id="fractional-volume",
+        sessions=(date(2026, 7, 20), date(2026, 7, 21)),
+        instruments={SYMBOL: INSTRUMENT},
+        bars={SYMBOL: bars},
+        initial_cash=Decimal("1000"),
+        initial_positions=(),
+        corporate_actions=(),
+        decision_source=_AssertingSource({date(2026, 7, 20): Decimal("1")}),
+        risk_engine=RiskEngine(()),
+        rule_book=MarketRuleBook((_profile(),)),
+    )
+
+    with pytest.raises(ValueError, match="bar volume must be an exact integer"):
+        BacktestEngine().run(request)
+
+
 def test_skipped_decision_preserves_existing_target_instead_of_liquidating() -> None:
     """Dropping ``preserve_unspecified`` would recreate non-rebalance liquidation."""
 

@@ -432,6 +432,7 @@ class KronosForecastStrategy:
             device=self.parameters.device,
         )
         self._last_forecast_positions: Mapping[InstrumentId, int] | None = None
+        self._last_target_weights: Mapping[InstrumentId, Decimal] | None = None
 
     def generate_targets(self, context: StrategyContext) -> StrategyDecision:
         prepared = _prepare_context(context, self.metadata.supported_asset_types)
@@ -454,10 +455,24 @@ class KronosForecastStrategy:
             < self.parameters.rebalance_interval
             for instrument in eligible
         ):
-            return StrategyDecision.empty(
-                StrategyDecisionStatus.SKIPPED,
-                "KRONOS_REBALANCE_NOT_DUE",
-                details={"rebalance_interval": self.parameters.rebalance_interval},
+            targets = self._last_target_weights or {}
+            return StrategyDecision.generated(
+                tuple(
+                    TargetIntent(
+                        strategy_id=self.strategy_id,
+                        instrument=instrument,
+                        target_weight=targets.get(instrument, Decimal("0")),
+                        score=0.0,
+                        confidence=1.0,
+                        reason_code="KRONOS_REBALANCE_HOLD",
+                        valid_until=context.as_of,
+                    )
+                    for instrument in sorted(eligible, key=str)
+                ),
+                details={
+                    "rebalance_interval": self.parameters.rebalance_interval,
+                    "reused_targets": True,
+                },
             )
         forecasts = self._forecaster.forecast(
             eligible,
@@ -498,6 +513,10 @@ class KronosForecastStrategy:
                 strict=True,
             )
         )
+        self._last_target_weights = {
+            instrument: selected_weights.get(instrument, Decimal("0"))
+            for instrument in eligible
+        }
         intents = []
         for instrument in sorted(eligible, key=str):
             forecast = by_instrument.get(instrument)

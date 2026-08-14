@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 import hashlib
+import logging
 from threading import Condition, RLock
 from types import TracebackType
 from typing import TypeAlias
@@ -18,9 +19,11 @@ from compass.services.safe_display import (
     safe_identifier,
     stable_code,
 )
+from compass.services.diagnostic_log import safe_diagnostic_text
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+_LOGGER = logging.getLogger("compass.tasks")
 Operation: TypeAlias = Callable[[], object]
 Clock: TypeAlias = Callable[[], datetime]
 IdFactory: TypeAlias = Callable[[], str]
@@ -372,11 +375,29 @@ class TaskManager:
                     code=error.code,
                     exception_type=type(error).__name__,
                 )
+                _LOGGER.warning(
+                    "task failed name=%s task_id=%s error_id=%s code=%s exception=%s detail=%s",
+                    record.name,
+                    record.task_id,
+                    failure.error_id,
+                    failure.code,
+                    failure.exception_type,
+                    safe_diagnostic_text(error),
+                )
             except BaseException as error:
                 failure = self._failure(
                     record,
                     code="TASK_OPERATION_FAILED",
                     exception_type=type(error).__name__,
+                )
+                _LOGGER.error(
+                    "task failed name=%s task_id=%s error_id=%s code=%s exception=%s detail=%s",
+                    record.name,
+                    record.task_id,
+                    failure.error_id,
+                    failure.code,
+                    failure.exception_type,
+                    safe_diagnostic_text(error),
                 )
             with self._lock:
                 current = self._records.get(task_id)

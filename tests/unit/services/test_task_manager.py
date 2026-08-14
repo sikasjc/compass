@@ -186,7 +186,7 @@ def test_queued_cancellation_is_immediate_and_never_runs_operation() -> None:
     manager.shutdown()
 
 
-def test_worker_failure_is_stable_secret_safe_and_does_not_escape() -> None:
+def test_worker_failure_is_stable_secret_safe_and_does_not_escape(caplog) -> None:  # type: ignore[no-untyped-def]
     manager = TaskManager(
         clock=FakeClock(),
         id_factory=_ids("task-fail"),
@@ -208,6 +208,9 @@ def test_worker_failure_is_stable_secret_safe_and_does_not_escape() -> None:
     assert secret not in repr(failed)
     assert "top-secret" not in repr(failed)
     assert "Users" not in repr(failed)
+    assert "error-local-1" in caplog.text
+    assert "top-secret" not in caplog.text
+    assert "token=[redacted]" in caplog.text
 
 
 def test_expected_operation_failure_preserves_only_its_stable_actionable_code() -> None:

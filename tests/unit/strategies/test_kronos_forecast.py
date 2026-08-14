@@ -114,15 +114,18 @@ def test_kronos_strategy_converts_forecasts_to_entry_and_cash_targets() -> None:
     assert forecaster.calls == 1
 
 
-def test_kronos_strategy_skips_repeated_inference_inside_rebalance_interval() -> None:
+def test_kronos_strategy_reuses_targets_inside_rebalance_interval() -> None:
     forecaster = ForecastStub()
     strategy = KronosForecastStrategy(parameters(), "kronos-test", forecaster)
 
     strategy.generate_targets(context())
     repeated = strategy.generate_targets(context())
 
-    assert repeated.status is StrategyDecisionStatus.SKIPPED
-    assert repeated.reason_code == "KRONOS_REBALANCE_NOT_DUE"
+    assert repeated.status is StrategyDecisionStatus.GENERATED
+    assert tuple((item.instrument, item.target_weight, item.reason_code) for item in repeated) == (
+        (FIRST, Decimal("0.8"), "KRONOS_REBALANCE_HOLD"),
+        (SECOND, Decimal("0"), "KRONOS_REBALANCE_HOLD"),
+    )
     assert forecaster.calls == 1
 
 

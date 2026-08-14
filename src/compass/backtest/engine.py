@@ -522,8 +522,18 @@ def _execution_bar(
         return None
     row = frame.loc[timestamp]
     volume_value = row["volume"]
-    if isinstance(volume_value, bool) or int(volume_value) != volume_value:
-        raise ValueError("bar volume must be an exact integer")
+    if isinstance(volume_value, bool) or not isinstance(
+        volume_value, (int, float, np.integer, np.floating)
+    ):
+        raise ValueError("bar volume must be numeric")
+    rounded_volume = round(float(volume_value))
+    tolerance = max(1e-6, abs(float(volume_value)) * 1e-12)
+    if not np.isfinite(volume_value) or abs(float(volume_value) - rounded_volume) > tolerance:
+        raise ValueError(
+            "bar volume must be an exact integer "
+            f"instrument={instrument.instrument_id} day={day.isoformat()} "
+            f"value={volume_value!r}"
+        )
     suspended_value = row.get("suspended", False)
     if pd.isna(suspended_value):
         # Missing optional suspension metadata is modeled as not suspended; callers
@@ -546,7 +556,7 @@ def _execution_bar(
     return DailyExecutionBar(
         open=_cell_decimal(row[execution_column], label=execution_column),  # type: ignore[arg-type]
         close=_cell_decimal(row["close"], label="close"),  # type: ignore[arg-type]
-        volume=int(volume_value),
+        volume=rounded_volume,
         suspended=suspended,
         limit_up=limits.limit_up,
         limit_down=limits.limit_down,
