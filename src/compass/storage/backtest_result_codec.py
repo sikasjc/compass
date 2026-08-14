@@ -5,7 +5,7 @@ from datetime import date
 from decimal import Decimal
 from math import isfinite
 
-from compass.backtest.engine import BacktestResult, RiskTrace
+from compass.backtest.engine import BacktestResult, ForecastTrace, RiskTrace
 from compass.backtest.orders import (
     CancellationReason,
     Fill,
@@ -170,6 +170,23 @@ def encode_backtest_result(result: BacktestResult) -> dict[str, object]:
             }
             for item in result.risk_traces
         ],
+        "forecast_traces": [
+            {
+                "action": item.action,
+                "close": encode_finite_float(item.close),
+                "decision_date": item.decision_date.isoformat(),
+                "expected_return": encode_finite_float(item.expected_return),
+                "instrument": str(item.instrument),
+                "path_positive_ratio": encode_finite_float(item.path_positive_ratio),
+                "rank": item.rank,
+                "reason_code": item.reason_code,
+                "strategy_id": item.strategy_id,
+                "target_weight": _decimal(item.target_weight),
+                "trend_passed": item.trend_passed,
+                "trend_value": encode_finite_float(item.trend_value),
+            }
+            for item in result.forecast_traces
+        ],
         "run_id": result.run_id,
         "used_profile_ids": list(result.used_profile_ids),
         "warnings": list(result.warnings),
@@ -326,6 +343,39 @@ def _decode_risk_trace(value: object) -> RiskTrace:
     )
 
 
+def _decode_forecast_trace(value: object) -> ForecastTrace:
+    item = _mapping(value)
+    if set(item) != {
+        "action",
+        "close",
+        "decision_date",
+        "expected_return",
+        "instrument",
+        "path_positive_ratio",
+        "rank",
+        "reason_code",
+        "strategy_id",
+        "target_weight",
+        "trend_passed",
+        "trend_value",
+    }:
+        raise ValueError("BACKTEST_RESULT_INTEGRITY")
+    return ForecastTrace(
+        decision_date=_day(item["decision_date"]),
+        strategy_id=_str(item["strategy_id"]),
+        instrument=InstrumentId.parse(_str(item["instrument"])),
+        action=_str(item["action"]),
+        expected_return=decode_finite_float(item["expected_return"]),
+        path_positive_ratio=decode_finite_float(item["path_positive_ratio"]),
+        rank=_int(item["rank"]),
+        close=decode_finite_float(item["close"]),
+        trend_value=decode_finite_float(item["trend_value"]),
+        trend_passed=_bool(item["trend_passed"]),
+        target_weight=_parsed_decimal(item["target_weight"]),
+        reason_code=_str(item["reason_code"]),
+    )
+
+
 def decode_backtest_result(value: object) -> BacktestResult:
     try:
         payload = _mapping(value)
@@ -338,7 +388,7 @@ def decode_backtest_result(value: object) -> BacktestResult:
             "used_profile_ids",
             "warnings",
         }
-        if set(payload) != expected:
+        if set(payload) not in (expected, expected | {"forecast_traces"}):
             raise ValueError
         result = BacktestResult(
             run_id=_str(payload["run_id"]),
@@ -348,6 +398,10 @@ def decode_backtest_result(value: object) -> BacktestResult:
             risk_traces=tuple(_decode_risk_trace(item) for item in _list(payload["risk_traces"])),
             used_profile_ids=_string_tuple(payload["used_profile_ids"]),
             warnings=_string_tuple(payload["warnings"]),
+            forecast_traces=tuple(
+                _decode_forecast_trace(item)
+                for item in _list(payload.get("forecast_traces", []))
+            ),
         )
         result.verify_integrity()
         return result

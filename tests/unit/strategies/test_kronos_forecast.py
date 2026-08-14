@@ -19,8 +19,8 @@ FIRST = InstrumentId.parse("SSE.510300")
 SECOND = InstrumentId.parse("SZSE.159949")
 
 
-def bars(*, rising: bool = True) -> pd.DataFrame:
-    close = [3 + position * 0.01 for position in range(80)]
+def bars(*, rising: bool = True, periods: int = 80) -> pd.DataFrame:
+    close = [3 + position * 0.01 for position in range(periods)]
     if not rising:
         close = list(reversed(close))
     return pd.DataFrame(
@@ -59,6 +59,26 @@ class ForecastStub:
         )
 
 
+class HysteresisForecastStub(ForecastStub):
+    def forecast(self, histories, **kwargs):  # type: ignore[no-untyped-def]
+        results = super().forecast(histories, **kwargs)
+        if self.calls == 1:
+            return results
+        return tuple(
+            KronosForecast(
+                instrument=item.instrument,
+                as_of=item.as_of,
+                horizon=item.horizon,
+                expected_return=0.0 if item.instrument == FIRST else item.expected_return,
+                path_positive_ratio=(
+                    0.2 if item.instrument == FIRST else item.path_positive_ratio
+                ),
+                predicted_closes=item.predicted_closes,
+            )
+            for item in results
+        )
+
+
 def parameters() -> KronosForecastParameters:
     return KronosForecastParameters(
         model_size="mini",
@@ -79,23 +99,30 @@ def parameters() -> KronosForecastParameters:
     )
 
 
-def context() -> StrategyContext:
-    frames = {FIRST: bars(), SECOND: bars()}
+def context(
+    *, periods: int = 80, held_instrument: InstrumentId | None = SECOND
+) -> StrategyContext:
+    frames = {FIRST: bars(periods=periods), SECOND: bars(periods=periods)}
+    holdings = (
+        {}
+        if held_instrument is None
+        else {
+            held_instrument: HoldingSummary(
+                held_instrument,
+                quantity=1000,
+                available_quantity=1000,
+                average_cost=Decimal("3"),
+                mark_price=Decimal("3.5"),
+            )
+        }
+    )
     return StrategyContext(
         as_of=frames[FIRST].index[-1].date(),
         bars=frames,
         instruments=(FIRST, SECOND),
         account_equity=Decimal("100000"),
         cash=Decimal("50000"),
-        holdings={
-            SECOND: HoldingSummary(
-                SECOND,
-                quantity=1000,
-                available_quantity=1000,
-                average_cost=Decimal("3"),
-                mark_price=Decimal("3.5"),
-            )
-        },
+        holdings=holdings,
         asset_types={FIRST: AssetType.ETF, SECOND: AssetType.ETF},
     )
 
@@ -112,6 +139,22 @@ def test_kronos_strategy_converts_forecasts_to_entry_and_cash_targets() -> None:
         (SECOND, Decimal("0"), "KRONOS_FORECAST_EXIT"),
     )
     assert forecaster.calls == 1
+    assert tuple(item.action for item in strategy.latest_diagnostics) == ("BUY", "SELL")
+
+
+def test_kronos_strategy_holds_between_entry_and_exit_thresholds() -> None:
+    forecaster = HysteresisForecastStub()
+    strategy = KronosForecastStrategy(parameters(), "kronos-test", forecaster)
+
+    strategy.generate_targets(context())
+    decision = strategy.generate_targets(context(periods=85, held_instrument=FIRST))
+
+    assert tuple((item.instrument, item.target_weight, item.reason_code) for item in decision) == (
+        (FIRST, Decimal("0.8"), "KRONOS_FORECAST_HOLD"),
+        (SECOND, Decimal("0"), "KRONOS_FORECAST_CASH"),
+    )
+    assert tuple(item.action for item in strategy.latest_diagnostics) == ("HOLD", "CASH")
+    assert forecaster.calls == 2
 
 
 def test_kronos_strategy_reuses_targets_inside_rebalance_interval() -> None:

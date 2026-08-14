@@ -737,6 +737,43 @@ def _signal_rows(report: BacktestReport) -> list[dict[str, object]]:
     return rows[-100:]
 
 
+_FORECAST_ACTION_LABELS = {
+    "BUY": "买入",
+    "HOLD": "继续持有",
+    "SELL": "卖出",
+    "CASH": "保持现金",
+}
+
+_FORECAST_REASON_LABELS = {
+    "KRONOS_FORECAST_ENTRY": "满足入场收益、路径一致性和趋势条件，并进入排名范围",
+    "KRONOS_FORECAST_HOLD": "已有目标仓位，预测尚未跌破退出阈值，继续持有",
+    "KRONOS_FORECAST_EXIT": "预测收益跌破退出阈值，退出目标仓位",
+    "KRONOS_FORECAST_CASH": "未同时满足入场条件或未进入排名范围",
+}
+
+
+def _forecast_trace_rows(report: BacktestReport) -> list[dict[str, object]]:
+    return [
+        {
+            "id": (
+                f"{item.decision_date.isoformat()}:{item.strategy_id}:"
+                f"{item.instrument}"
+            ),
+            "date": item.decision_date.isoformat(),
+            "strategy": item.strategy_id,
+            "instrument": str(item.instrument),
+            "rank": item.rank,
+            "return": f"{item.expected_return * 100:.2f}%",
+            "positive": f"{item.path_positive_ratio * 100:.0f}%",
+            "trend": "通过" if item.trend_passed else "未通过",
+            "action": _FORECAST_ACTION_LABELS[item.action],
+            "weight": f"{float(item.target_weight) * 100:.1f}%",
+            "reason": _FORECAST_REASON_LABELS.get(item.reason_code, item.reason_code),
+        }
+        for item in reversed(report.result.forecast_traces[-100:])
+    ]
+
+
 def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
     if model is None:
         ui.label("策略回测服务尚未配置。").classes("text-sm text-slate-600")
@@ -1805,6 +1842,33 @@ def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
                 f"期末总资产 ¥{final_ledger.equity:,.2f} · "
                 f"现金 ¥{final_ledger.cash:,.2f} · 成交 {len(report.result.fills)} 笔"
             ).classes("font-medium")
+            forecast_rows = _forecast_trace_rows(report)
+            if forecast_rows:
+                ui.label("Kronos 预测诊断").classes("text-base font-semibold mt-2")
+                ui.label(
+                    "只记录 Kronos 实际重新预测的交易日；策略内仓位还会乘以该策略的资金占比，形成组合最终仓位。"
+                ).classes("text-xs text-slate-500")
+                ui.table(
+                    columns=[
+                        {"name": "date", "label": "预测日", "field": "date"},
+                        {"name": "strategy", "label": "策略", "field": "strategy"},
+                        {"name": "instrument", "label": "标的", "field": "instrument"},
+                        {"name": "rank", "label": "排名", "field": "rank"},
+                        {"name": "return", "label": "预测收益", "field": "return"},
+                        {
+                            "name": "positive",
+                            "label": "路径看涨比例",
+                            "field": "positive",
+                        },
+                        {"name": "trend", "label": "趋势过滤", "field": "trend"},
+                        {"name": "action", "label": "决定", "field": "action"},
+                        {"name": "weight", "label": "策略内仓位", "field": "weight"},
+                        {"name": "reason", "label": "原因", "field": "reason"},
+                    ],
+                    rows=forecast_rows,
+                    row_key="id",
+                    pagination=10,
+                ).classes("w-full")
             signal_rows = _signal_rows(report)
             if signal_rows:
                 ui.label("信号与成交对照").classes("text-base font-semibold mt-2")

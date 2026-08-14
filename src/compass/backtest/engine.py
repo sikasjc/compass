@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
 from enum import StrEnum
+from math import isfinite
 import re
 from types import MappingProxyType
 from typing import Protocol, runtime_checkable
@@ -196,12 +197,57 @@ def _freeze_sleeves(
 
 
 @dataclass(frozen=True, slots=True)
+class ForecastTrace:
+    """A persisted explanation for one model forecast and portfolio decision."""
+
+    decision_date: date
+    strategy_id: str
+    instrument: InstrumentId
+    action: str
+    expected_return: float
+    path_positive_ratio: float
+    rank: int
+    close: float
+    trend_value: float
+    trend_passed: bool
+    target_weight: Decimal
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        _exact_date(self.decision_date, label="forecast trace decision_date")
+        if type(self.strategy_id) is not str or not self.strategy_id.strip():
+            raise ValueError("forecast trace strategy_id must be a non-empty string")
+        if type(self.instrument) is not InstrumentId:
+            raise TypeError("forecast trace instrument must be an exact InstrumentId")
+        if type(self.action) is not str or self.action not in {"BUY", "HOLD", "SELL", "CASH"}:
+            raise ValueError("forecast trace action is invalid")
+        for label, value in (
+            ("expected_return", self.expected_return),
+            ("path_positive_ratio", self.path_positive_ratio),
+            ("close", self.close),
+            ("trend_value", self.trend_value),
+        ):
+            if type(value) is not float or not isfinite(value):
+                raise ValueError(f"forecast trace {label} must be a finite float")
+        if not 0 <= self.path_positive_ratio <= 1:
+            raise ValueError("forecast trace path_positive_ratio must be between zero and one")
+        if type(self.rank) is not int or self.rank <= 0:
+            raise ValueError("forecast trace rank must be a positive integer")
+        if type(self.trend_passed) is not bool:
+            raise TypeError("forecast trace trend_passed must be an exact bool")
+        weight_to_units(self.target_weight, label="forecast trace target weight")
+        if type(self.reason_code) is not str or _WARNING_CODE.fullmatch(self.reason_code) is None:
+            raise ValueError("forecast trace reason_code is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class DecisionTarget:
     """Narrow deterministic adapter for already-allocated portfolio weights."""
 
     weights: Mapping[InstrumentId, Decimal]
     sleeve_weights: Mapping[InstrumentId, Mapping[str, Decimal]]
     preserve_unspecified: bool = False
+    forecast_traces: tuple[ForecastTrace, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.weights, Mapping):
@@ -228,6 +274,15 @@ class DecisionTarget:
         object.__setattr__(self, "sleeve_weights", sleeves)
         if type(self.preserve_unspecified) is not bool:
             raise TypeError("preserve_unspecified must be an exact bool")
+        traces = tuple(self.forecast_traces)
+        if any(type(item) is not ForecastTrace for item in traces):
+            raise TypeError("forecast_traces must contain exact ForecastTrace values")
+        trace_keys = tuple(
+            (item.decision_date, item.strategy_id, str(item.instrument)) for item in traces
+        )
+        if trace_keys != tuple(sorted(set(trace_keys))):
+            raise ValueError("forecast traces must be unique and sorted")
+        object.__setattr__(self, "forecast_traces", traces)
 
 
 @runtime_checkable
@@ -406,6 +461,7 @@ class BacktestResult:
     risk_traces: tuple[RiskTrace, ...]
     used_profile_ids: tuple[str, ...]
     warnings: tuple[str, ...]
+    forecast_traces: tuple[ForecastTrace, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.run_id) is not str or not self.run_id or self.run_id != self.run_id.strip():
@@ -415,6 +471,7 @@ class BacktestResult:
             ("fills", self.fills, Fill),
             ("ledger", self.ledger, LedgerSnapshot),
             ("risk_traces", self.risk_traces, RiskTrace),
+            ("forecast_traces", self.forecast_traces, ForecastTrace),
         )
         for label, values, item_type in expected:
             _validate_exact_tuple(label, values, item_type)
@@ -433,6 +490,12 @@ class BacktestResult:
             raise ValueError("result fills must have unique ids")
         _validate_string_tuple("used_profile_ids", self.used_profile_ids)
         _validate_warning_tuple(self.warnings)
+        forecast_keys = tuple(
+            (item.decision_date, item.strategy_id, str(item.instrument))
+            for item in self.forecast_traces
+        )
+        if forecast_keys != tuple(sorted(set(forecast_keys))):
+            raise ValueError("forecast traces must be unique and sorted")
         orders_by_id = {order.order_id: order for order in self.orders}
         fills_by_order: dict[str, list[Fill]] = {}
         ledger_days_set = set(ledger_days)
@@ -490,8 +553,10 @@ class BacktestResult:
             for position in snapshot.positions:
                 position.__post_init__()
             snapshot.__post_init__()
-        for trace in self.risk_traces:
-            trace.__post_init__()
+        for risk_trace in self.risk_traces:
+            risk_trace.__post_init__()
+        for forecast_trace in self.forecast_traces:
+            forecast_trace.__post_init__()
 
 
 def _cell_decimal(value: object, *, label: str, optional: bool = False) -> Decimal | None:
@@ -822,6 +887,7 @@ class BacktestEngine:
         fills: list[Fill] = []
         ledger: list[LedgerSnapshot] = []
         traces: list[RiskTrace] = []
+        forecast_traces: list[ForecastTrace] = []
         used_profiles: set[str] = set()
         warnings: set[str] = set(request._data_warnings)
         actions_by_day: dict[date, list[CorporateAction]] = {}
@@ -872,6 +938,7 @@ class BacktestEngine:
             }
             context = self._context(request, day, snapshot, holding_since)
             target = _source_target(request.decision_source.targets(context), request.instruments)
+            forecast_traces.extend(target.forecast_traces)
             next_day = request.sessions[index + 1] if index + 1 < len(request.sessions) else None
             created, decision_traces, decision_profiles, decision_warnings = self._orders_at_close(
                 request, day, next_day, snapshot, target
@@ -891,4 +958,5 @@ class BacktestEngine:
             risk_traces=tuple(traces),
             used_profile_ids=tuple(sorted(used_profiles)),
             warnings=tuple(sorted(warnings)),
+            forecast_traces=tuple(forecast_traces),
         )

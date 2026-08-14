@@ -67,6 +67,20 @@ class KronosForecast:
             raise ValueError("forecast closes must contain one positive value per horizon day")
 
 
+@dataclass(frozen=True, slots=True)
+class KronosForecastDiagnostic:
+    instrument: InstrumentId
+    action: str
+    expected_return: float
+    path_positive_ratio: float
+    rank: int
+    close: float
+    trend_value: float
+    trend_passed: bool
+    target_weight: Decimal
+    reason_code: str
+
+
 class KronosForecaster(Protocol):
     def forecast(
         self,
@@ -433,6 +447,11 @@ class KronosForecastStrategy:
         )
         self._last_forecast_positions: Mapping[InstrumentId, int] | None = None
         self._last_target_weights: Mapping[InstrumentId, Decimal] | None = None
+        self._latest_diagnostics: tuple[KronosForecastDiagnostic, ...] = ()
+
+    @property
+    def latest_diagnostics(self) -> tuple[KronosForecastDiagnostic, ...]:
+        return self._latest_diagnostics
 
     def generate_targets(self, context: StrategyContext) -> StrategyDecision:
         prepared = _prepare_context(context, self.metadata.supported_asset_types)
@@ -444,6 +463,7 @@ class KronosForecastStrategy:
             if len(prepared.histories[instrument]) >= self.required_history
         }
         if not eligible:
+            self._latest_diagnostics = ()
             return StrategyDecision.empty(
                 StrategyDecisionStatus.SKIPPED,
                 "INSUFFICIENT_HISTORY",
@@ -455,6 +475,7 @@ class KronosForecastStrategy:
             < self.parameters.rebalance_interval
             for instrument in eligible
         ):
+            self._latest_diagnostics = ()
             targets = self._last_target_weights or {}
             return StrategyDecision.generated(
                 tuple(
@@ -489,7 +510,19 @@ class KronosForecastStrategy:
         entry_return = float(self.parameters.entry_return)
         exit_return = float(self.parameters.exit_return)
         minimum_positive = float(self.parameters.minimum_path_positive_ratio)
-        selected: list[tuple[InstrumentId, float]] = []
+        previous_targets = self._last_target_weights or {}
+        active = {
+            instrument
+            for instrument in eligible
+            if previous_targets.get(instrument, Decimal("0")) > 0
+            or (
+                (holding := context.holding(instrument)) is not None
+                and holding.quantity > 0
+            )
+        }
+        kept: list[tuple[InstrumentId, float]] = []
+        entry_candidates: list[tuple[InstrumentId, float]] = []
+        market_state: dict[InstrumentId, tuple[float, float, bool]] = {}
         for instrument, frame in eligible.items():
             forecast = by_instrument.get(instrument)
             if forecast is None:
@@ -497,15 +530,20 @@ class KronosForecastStrategy:
             close = float(frame["close"].iloc[-1])
             trend = simple_moving_average(frame["close"], self.parameters.trend_window)
             trend_value = float(trend.iloc[-1])
-            if (
+            trend_passed = isfinite(trend_value) and close >= trend_value
+            market_state[instrument] = (close, trend_value, trend_passed)
+            if instrument in active:
+                if forecast.expected_return > exit_return:
+                    kept.append((instrument, forecast.expected_return))
+            elif (
                 forecast.expected_return >= entry_return
                 and forecast.path_positive_ratio >= minimum_positive
-                and isfinite(trend_value)
-                and close >= trend_value
+                and trend_passed
             ):
-                selected.append((instrument, forecast.expected_return))
+                entry_candidates.append((instrument, forecast.expected_return))
+        entry_candidates.sort(key=lambda item: (-item[1], str(item[0])))
+        selected = kept + entry_candidates[: max(0, self.parameters.top_n - len(kept))]
         selected.sort(key=lambda item: (-item[1], str(item[0])))
-        selected = selected[: self.parameters.top_n]
         selected_weights = dict(
             zip(
                 (instrument for instrument, _ in selected),
@@ -517,21 +555,42 @@ class KronosForecastStrategy:
             instrument: selected_weights.get(instrument, Decimal("0"))
             for instrument in eligible
         }
+        ranks = {
+            instrument: rank
+            for rank, (instrument, _) in enumerate(
+                sorted(
+                    (
+                        (instrument, forecast.expected_return)
+                        for instrument, forecast in by_instrument.items()
+                        if instrument in eligible
+                    ),
+                    key=lambda item: (-item[1], str(item[0])),
+                ),
+                start=1,
+            )
+        }
         intents = []
+        diagnostics = []
         for instrument in sorted(eligible, key=str):
             forecast = by_instrument.get(instrument)
             if forecast is None:
                 continue
             target = selected_weights.get(instrument, Decimal("0"))
-            holding = context.holding(instrument)
-            held = holding is not None and holding.quantity > 0
-            if target > 0:
+            was_active = instrument in active
+            if target > 0 and was_active:
+                action = "HOLD"
+                reason = "KRONOS_FORECAST_HOLD"
+                threshold = max(abs(exit_return), 0.000001)
+            elif target > 0:
+                action = "BUY"
                 reason = "KRONOS_FORECAST_ENTRY"
                 threshold = entry_return
-            elif held and forecast.expected_return <= exit_return:
+            elif was_active:
+                action = "SELL"
                 reason = "KRONOS_FORECAST_EXIT"
                 threshold = abs(exit_return)
             else:
+                action = "CASH"
                 reason = "KRONOS_FORECAST_CASH"
                 threshold = max(entry_return, abs(exit_return))
             intents.append(
@@ -548,6 +607,22 @@ class KronosForecastStrategy:
                     valid_until=context.as_of,
                 )
             )
+            close, trend_value, trend_passed = market_state[instrument]
+            diagnostics.append(
+                KronosForecastDiagnostic(
+                    instrument=instrument,
+                    action=action,
+                    expected_return=forecast.expected_return,
+                    path_positive_ratio=forecast.path_positive_ratio,
+                    rank=ranks[instrument],
+                    close=close,
+                    trend_value=trend_value,
+                    trend_passed=trend_passed,
+                    target_weight=target,
+                    reason_code=reason,
+                )
+            )
+        self._latest_diagnostics = tuple(diagnostics)
         details = {
             "model_size": self.parameters.model_size,
             "forecast_count": len(forecasts),

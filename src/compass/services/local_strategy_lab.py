@@ -12,6 +12,7 @@ from compass.backtest.engine import (
     BacktestRequest,
     DecisionTarget,
     DecisionSource,
+    ForecastTrace,
 )
 from compass.backtest.broker import InitialPosition
 from compass.backtest.orders import round_money
@@ -277,10 +278,15 @@ class _CombinedStrategyDecisionSource:
             > WEIGHT_SCALE
         ):
             return target
-        return DecisionTarget(adjusted, target.sleeve_weights)
+        return DecisionTarget(
+            adjusted,
+            target.sleeve_weights,
+            forecast_traces=target.forecast_traces,
+        )
 
     def targets(self, context: StrategyContext) -> DecisionTarget:
         intents: list[TargetIntent] = []
+        forecast_traces: list[ForecastTrace] = []
         for strategy in self._strategies:
             if strategy.strategy is StrategyLabKind.KRONOS_FORECAST:
                 kronos_context = StrategyContext(
@@ -306,6 +312,25 @@ class _CombinedStrategyDecisionSource:
                     kronos_context
                 )
                 intents.extend(decision.intents)
+                forecast_traces.extend(
+                    ForecastTrace(
+                        decision_date=context.as_of,
+                        strategy_id=strategy.strategy_id,
+                        instrument=item.instrument,
+                        action=item.action,
+                        expected_return=item.expected_return,
+                        path_positive_ratio=item.path_positive_ratio,
+                        rank=item.rank,
+                        close=item.close,
+                        trend_value=item.trend_value,
+                        trend_passed=item.trend_passed,
+                        target_weight=item.target_weight,
+                        reason_code=item.reason_code,
+                    )
+                    for item in self._kronos_strategies[
+                        strategy.strategy_id
+                    ].latest_diagnostics
+                )
                 continue
             active = self._active(strategy, context)
             for instrument, weight in self._weights[strategy.strategy_id].items():
@@ -332,15 +357,35 @@ class _CombinedStrategyDecisionSource:
                 )
         allocated = self._allocator.allocate(intents, self._policy)
         requested = dict(allocated.weights)
+        traces = tuple(
+            sorted(
+                forecast_traces,
+                key=lambda item: (
+                    item.decision_date,
+                    item.strategy_id,
+                    str(item.instrument),
+                ),
+            )
+        )
         if (
             self._rebalance_mode is StrategyLabRebalanceMode.SIGNAL_CHANGE
             and self._last_requested_weights == requested
         ):
-            return DecisionTarget({}, {}, preserve_unspecified=True)
+            return DecisionTarget(
+                {}, {}, preserve_unspecified=True, forecast_traces=traces
+            )
         if not self._is_rebalance_session(context):
-            return DecisionTarget({}, {}, preserve_unspecified=True)
+            return DecisionTarget(
+                {}, {}, preserve_unspecified=True, forecast_traces=traces
+            )
         self._last_requested_weights = requested
-        return self._suppress_small_trades(context, self._decision_target(allocated))
+        allocated_target = self._decision_target(allocated)
+        explained_target = DecisionTarget(
+            allocated_target.weights,
+            allocated_target.sleeve_weights,
+            forecast_traces=traces,
+        )
+        return self._suppress_small_trades(context, explained_target)
 
 
 class LocalStrategyLabGateway:
