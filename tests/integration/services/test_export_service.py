@@ -274,6 +274,9 @@ def test_backtest_export_is_reproducible_bom_csv_and_utf8_json(tmp_path: Path) -
     assert payload["results"]["equity_curve"]
     assert payload["results"]["fills"]
     assert payload["results"]["sleeve_attribution"]
+    assert payload["results"]["forecast_quality"]["forecast_count"] == 0
+    assert payload["results"]["forecast_traces"] == []
+    assert payload["results"]["forecast_evaluations"] == []
     assert payload["disclaimer"] == DISCLAIMER
     combined = csv_bytes.decode("utf-8-sig") + json_bytes.decode("utf-8")
     assert "manifest-etf-bars-1" in combined

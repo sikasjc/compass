@@ -5,7 +5,12 @@ from datetime import date
 from decimal import Decimal
 from math import isfinite
 
-from compass.backtest.engine import BacktestResult, ForecastTrace, RiskTrace
+from compass.backtest.engine import (
+    BacktestResult,
+    ForecastEvaluation,
+    ForecastTrace,
+    RiskTrace,
+)
 from compass.backtest.orders import (
     CancellationReason,
     Fill,
@@ -176,6 +181,7 @@ def encode_backtest_result(result: BacktestResult) -> dict[str, object]:
                 "close": encode_finite_float(item.close),
                 "decision_date": item.decision_date.isoformat(),
                 "expected_return": encode_finite_float(item.expected_return),
+                "horizon": item.horizon,
                 "instrument": str(item.instrument),
                 "path_positive_ratio": encode_finite_float(item.path_positive_ratio),
                 "rank": item.rank,
@@ -186,6 +192,19 @@ def encode_backtest_result(result: BacktestResult) -> dict[str, object]:
                 "trend_value": encode_finite_float(item.trend_value),
             }
             for item in result.forecast_traces
+        ],
+        "forecast_evaluations": [
+            {
+                "decision_date": item.decision_date.isoformat(),
+                "evaluation_date": item.evaluation_date.isoformat(),
+                "execution_date": item.execution_date.isoformat(),
+                "horizon": item.horizon,
+                "instrument": str(item.instrument),
+                "realized_close_return": encode_finite_float(item.realized_close_return),
+                "strategy_id": item.strategy_id,
+                "tradable_return": encode_finite_float(item.tradable_return),
+            }
+            for item in result.forecast_evaluations
         ],
         "run_id": result.run_id,
         "used_profile_ids": list(result.used_profile_ids),
@@ -345,7 +364,7 @@ def _decode_risk_trace(value: object) -> RiskTrace:
 
 def _decode_forecast_trace(value: object) -> ForecastTrace:
     item = _mapping(value)
-    if set(item) != {
+    expected = {
         "action",
         "close",
         "decision_date",
@@ -358,7 +377,8 @@ def _decode_forecast_trace(value: object) -> ForecastTrace:
         "target_weight",
         "trend_passed",
         "trend_value",
-    }:
+    }
+    if set(item) not in (expected, expected | {"horizon"}):
         raise ValueError("BACKTEST_RESULT_INTEGRITY")
     return ForecastTrace(
         decision_date=_day(item["decision_date"]),
@@ -373,6 +393,32 @@ def _decode_forecast_trace(value: object) -> ForecastTrace:
         trend_passed=_bool(item["trend_passed"]),
         target_weight=_parsed_decimal(item["target_weight"]),
         reason_code=_str(item["reason_code"]),
+        horizon=1 if "horizon" not in item else _int(item["horizon"]),
+    )
+
+
+def _decode_forecast_evaluation(value: object) -> ForecastEvaluation:
+    item = _mapping(value)
+    if set(item) != {
+        "decision_date",
+        "evaluation_date",
+        "execution_date",
+        "horizon",
+        "instrument",
+        "realized_close_return",
+        "strategy_id",
+        "tradable_return",
+    }:
+        raise ValueError("BACKTEST_RESULT_INTEGRITY")
+    return ForecastEvaluation(
+        decision_date=_day(item["decision_date"]),
+        strategy_id=_str(item["strategy_id"]),
+        instrument=InstrumentId.parse(_str(item["instrument"])),
+        horizon=_int(item["horizon"]),
+        execution_date=_day(item["execution_date"]),
+        evaluation_date=_day(item["evaluation_date"]),
+        realized_close_return=decode_finite_float(item["realized_close_return"]),
+        tradable_return=decode_finite_float(item["tradable_return"]),
     )
 
 
@@ -388,7 +434,8 @@ def decode_backtest_result(value: object) -> BacktestResult:
             "used_profile_ids",
             "warnings",
         }
-        if set(payload) not in (expected, expected | {"forecast_traces"}):
+        optional = {"forecast_traces", "forecast_evaluations"}
+        if not expected.issubset(payload) or not set(payload).issubset(expected | optional):
             raise ValueError
         result = BacktestResult(
             run_id=_str(payload["run_id"]),
@@ -401,6 +448,10 @@ def decode_backtest_result(value: object) -> BacktestResult:
             forecast_traces=tuple(
                 _decode_forecast_trace(item)
                 for item in _list(payload.get("forecast_traces", []))
+            ),
+            forecast_evaluations=tuple(
+                _decode_forecast_evaluation(item)
+                for item in _list(payload.get("forecast_evaluations", []))
             ),
         )
         result.verify_integrity()

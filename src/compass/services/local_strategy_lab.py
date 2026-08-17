@@ -289,6 +289,7 @@ class _CombinedStrategyDecisionSource:
         forecast_traces: list[ForecastTrace] = []
         for strategy in self._strategies:
             if strategy.strategy is StrategyLabKind.KRONOS_FORECAST:
+                assert strategy.kronos_parameters is not None
                 kronos_context = StrategyContext(
                     as_of=context.as_of,
                     bars={
@@ -326,6 +327,7 @@ class _CombinedStrategyDecisionSource:
                         trend_passed=item.trend_passed,
                         target_weight=item.target_weight,
                         reason_code=item.reason_code,
+                        horizon=strategy.kronos_parameters.horizon,
                     )
                     for item in self._kronos_strategies[
                         strategy.strategy_id

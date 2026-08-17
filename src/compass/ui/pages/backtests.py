@@ -10,6 +10,10 @@ from typing import Protocol, TypeVar, cast
 from nicegui import ui
 import pandas as pd  # type: ignore[import-untyped]
 
+from compass.analytics.forecast_quality import (
+    ForecastQualityMetrics,
+    calculate_forecast_quality,
+)
 from compass.analytics.metrics import PerformanceMetrics, calculate_metrics
 from compass.analytics.sleeve_accounting import (
     SleeveAccounting,
@@ -104,6 +108,7 @@ class BacktestReport:
     result: BacktestResult
     snapshot: RunSnapshot
     metrics: PerformanceMetrics
+    forecast_quality: ForecastQualityMetrics
     equity_curve: tuple[CurvePoint, ...]
     drawdown_curve: tuple[CurvePoint, ...]
     benchmark_curve: tuple[CurvePoint, ...]
@@ -160,6 +165,10 @@ class BacktestReport:
             else pd.Series(tuple(item.value for item in benchmark), index=index)
         )
         metrics = calculate_metrics(metric_frame, benchmark_series)
+        forecast_quality = calculate_forecast_quality(
+            result.forecast_traces,
+            result.forecast_evaluations,
+        )
         equity_values = tuple(float(item.equity) for item in result.ledger)
         equity = tuple(
             CurvePoint(day, value) for day, value in zip(day_labels, equity_values, strict=True)
@@ -196,6 +205,7 @@ class BacktestReport:
             "result": result,
             "snapshot": snapshot,
             "metrics": metrics,
+            "forecast_quality": forecast_quality,
             "equity_curve": equity,
             "drawdown_curve": tuple(drawdown_points),
             "benchmark_curve": benchmark,
@@ -226,6 +236,8 @@ class BacktestReport:
             raise TypeError("snapshot must be an exact RunSnapshot")
         if type(self.metrics) is not PerformanceMetrics:
             raise TypeError("metrics must be exact PerformanceMetrics")
+        if type(self.forecast_quality) is not ForecastQualityMetrics:
+            raise TypeError("forecast quality must be exact ForecastQualityMetrics")
         if self.result.run_id != self.run_id or self.snapshot.run_id != self.run_id:
             raise ValueError("report, result and snapshot run identities must match")
         self.snapshot.verify_integrity()
@@ -298,6 +310,7 @@ class BacktestReport:
             "result",
             "snapshot",
             "metrics",
+            "forecast_quality",
             "equity_curve",
             "drawdown_curve",
             "benchmark_curve",

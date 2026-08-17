@@ -359,6 +359,21 @@ def _metrics(report: BacktestReport) -> Mapping[str, object]:
     }
 
 
+def _forecast_quality(report: BacktestReport) -> Mapping[str, object]:
+    quality = report.forecast_quality
+    return {
+        "forecast_count": quality.forecast_count,
+        "evaluated_count": quality.evaluated_count,
+        "selected_count": quality.selected_count,
+        "direction_accuracy": quality.direction_accuracy,
+        "return_correlation": quality.return_correlation,
+        "mean_predicted_return": quality.mean_predicted_return,
+        "mean_realized_close_return": quality.mean_realized_close_return,
+        "mean_tradable_return": quality.mean_tradable_return,
+        "selected_mean_tradable_return": quality.selected_mean_tradable_return,
+    }
+
+
 def _backtest_payload(report: BacktestReport) -> Mapping[str, object]:
     report.verify_integrity()
     return {
@@ -370,6 +385,38 @@ def _backtest_payload(report: BacktestReport) -> Mapping[str, object]:
         "reproduction": _snapshot(report.snapshot),
         "results": {
             "metrics": _metrics(report),
+            "forecast_quality": _forecast_quality(report),
+            "forecast_traces": tuple(
+                {
+                    "decision_date": item.decision_date,
+                    "strategy_id": item.strategy_id,
+                    "instrument": str(item.instrument),
+                    "horizon": item.horizon,
+                    "action": item.action,
+                    "expected_return": item.expected_return,
+                    "path_positive_ratio": item.path_positive_ratio,
+                    "rank": item.rank,
+                    "close": item.close,
+                    "trend_value": item.trend_value,
+                    "trend_passed": item.trend_passed,
+                    "target_weight": item.target_weight,
+                    "reason_code": item.reason_code,
+                }
+                for item in report.result.forecast_traces
+            ),
+            "forecast_evaluations": tuple(
+                {
+                    "decision_date": item.decision_date,
+                    "strategy_id": item.strategy_id,
+                    "instrument": str(item.instrument),
+                    "horizon": item.horizon,
+                    "execution_date": item.execution_date,
+                    "evaluation_date": item.evaluation_date,
+                    "realized_close_return": item.realized_close_return,
+                    "tradable_return": item.tradable_return,
+                }
+                for item in report.result.forecast_evaluations
+            ),
             "equity_curve": tuple(
                 {"day": item.day, "value": item.value} for item in report.equity_curve
             ),

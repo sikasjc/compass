@@ -13,6 +13,7 @@ from compass.backtest.engine import (
     BacktestResult,
     DecisionTarget,
     ExecutionTiming,
+    ForecastTrace,
 )
 from compass.backtest.broker import InitialPosition
 from compass.backtest.market_rules import (
@@ -143,6 +144,73 @@ def test_close_signal_can_be_configured_to_fill_at_next_close() -> None:
     assert result.fills[0].trading_day == date(2026, 7, 21)
     assert result.fills[0].price == Decimal("4.2000")
     assert result.fills[0].price != _bars().iloc[1]["open"]
+
+
+def test_forecast_evaluation_uses_next_execution_price_and_skips_unmatured_tail() -> None:
+    sessions = (
+        date(2026, 7, 20),
+        date(2026, 7, 21),
+        date(2026, 7, 22),
+        date(2026, 7, 23),
+    )
+    bars = pd.DataFrame(
+        {
+            "open": [Decimal("10"), Decimal("12"), Decimal("14"), Decimal("16")],
+            "high": [Decimal("11"), Decimal("14"), Decimal("16"), Decimal("18")],
+            "low": [Decimal("9"), Decimal("11"), Decimal("13"), Decimal("15")],
+            "close": [Decimal("10"), Decimal("13"), Decimal("15"), Decimal("17")],
+            "volume": [100_000] * 4,
+            "amount": [Decimal("1000000")] * 4,
+        },
+        index=pd.to_datetime(sessions),
+    )
+
+    class ForecastSource:
+        def targets(self, context: StrategyContext) -> DecisionTarget:
+            traces = ()
+            if context.as_of in {sessions[0], sessions[-1]}:
+                traces = (
+                    ForecastTrace(
+                        decision_date=context.as_of,
+                        strategy_id="kronos-main",
+                        instrument=SYMBOL,
+                        action="CASH",
+                        expected_return=0.20,
+                        path_positive_ratio=0.75,
+                        rank=1,
+                        close=float(context.history(SYMBOL)["close"].iloc[-1]),
+                        trend_value=9.0,
+                        trend_passed=True,
+                        target_weight=Decimal("0"),
+                        reason_code="KRONOS_FORECAST_CASH",
+                        horizon=2,
+                    ),
+                )
+            return DecisionTarget({SYMBOL: Decimal("0")}, {}, forecast_traces=traces)
+
+    request = BacktestRequest(
+        run_id="forecast-evaluation",
+        sessions=sessions,
+        instruments={SYMBOL: INSTRUMENT},
+        bars={SYMBOL: bars},
+        initial_cash=Decimal("1000"),
+        initial_positions=(),
+        corporate_actions=(),
+        decision_source=ForecastSource(),
+        risk_engine=RiskEngine(()),
+        rule_book=MarketRuleBook((_profile(),)),
+        execution_timing=ExecutionTiming.NEXT_OPEN,
+    )
+
+    result = BacktestEngine().run(request)
+
+    assert len(result.forecast_traces) == 2
+    assert len(result.forecast_evaluations) == 1
+    evaluation = result.forecast_evaluations[0]
+    assert evaluation.execution_date == sessions[1]
+    assert evaluation.evaluation_date == sessions[2]
+    assert evaluation.realized_close_return == pytest.approx(0.50)
+    assert evaluation.tradable_return == pytest.approx(0.25)
 
 
 def test_execution_accepts_provider_float_noise_around_integer_volume() -> None:

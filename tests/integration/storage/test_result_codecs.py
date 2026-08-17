@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from compass.backtest.engine import ForecastTrace
+from compass.backtest.engine import ForecastEvaluation, ForecastTrace
 from compass.domain.market import InstrumentId
 from compass.storage.backtest_result_codec import (
     decode_backtest_result,
@@ -27,7 +27,7 @@ def test_backtest_codec_round_trips_forecast_diagnostics() -> None:
         multi_reallocation_result(),
         forecast_traces=(
             ForecastTrace(
-                decision_date=date(2025, 1, 2),
+                decision_date=date(2026, 7, 20),
                 strategy_id="kronos-1",
                 instrument=InstrumentId.parse("SSE.510300"),
                 action="BUY",
@@ -39,11 +39,54 @@ def test_backtest_codec_round_trips_forecast_diagnostics() -> None:
                 trend_passed=True,
                 target_weight=Decimal("0.8"),
                 reason_code="KRONOS_FORECAST_ENTRY",
+                horizon=3,
+            ),
+        ),
+        forecast_evaluations=(
+            ForecastEvaluation(
+                decision_date=date(2026, 7, 20),
+                strategy_id="kronos-1",
+                instrument=InstrumentId.parse("SSE.510300"),
+                horizon=3,
+                execution_date=date(2026, 7, 21),
+                evaluation_date=date(2026, 7, 23),
+                realized_close_return=0.02,
+                tradable_return=0.01,
             ),
         ),
     )
 
     assert decode_backtest_result(encode_backtest_result(result)) == result
+
+
+def test_backtest_codec_reads_pre_evaluation_forecast_payload() -> None:
+    result = replace(
+        multi_reallocation_result(),
+        forecast_traces=(
+            ForecastTrace(
+                decision_date=date(2026, 7, 20),
+                strategy_id="kronos-legacy",
+                instrument=InstrumentId.parse("SSE.510300"),
+                action="CASH",
+                expected_return=-0.01,
+                path_positive_ratio=0.25,
+                rank=1,
+                close=4.12,
+                trend_value=4.20,
+                trend_passed=False,
+                target_weight=Decimal("0"),
+                reason_code="KRONOS_FORECAST_CASH",
+            ),
+        ),
+    )
+    encoded = encode_backtest_result(result)
+    encoded.pop("forecast_evaluations")
+    encoded["forecast_traces"][0].pop("horizon")
+
+    restored = decode_backtest_result(encoded)
+
+    assert restored.forecast_traces[0].horizon == 1
+    assert restored.forecast_evaluations == ()
 
 
 def test_backtest_codec_rejects_unknown_nested_record_keys() -> None:

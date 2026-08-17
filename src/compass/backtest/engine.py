@@ -212,6 +212,7 @@ class ForecastTrace:
     trend_passed: bool
     target_weight: Decimal
     reason_code: str
+    horizon: int = 1
 
     def __post_init__(self) -> None:
         _exact_date(self.decision_date, label="forecast trace decision_date")
@@ -233,11 +234,46 @@ class ForecastTrace:
             raise ValueError("forecast trace path_positive_ratio must be between zero and one")
         if type(self.rank) is not int or self.rank <= 0:
             raise ValueError("forecast trace rank must be a positive integer")
+        if type(self.horizon) is not int or self.horizon <= 0:
+            raise ValueError("forecast trace horizon must be a positive integer")
         if type(self.trend_passed) is not bool:
             raise TypeError("forecast trace trend_passed must be an exact bool")
         weight_to_units(self.target_weight, label="forecast trace target weight")
         if type(self.reason_code) is not str or _WARNING_CODE.fullmatch(self.reason_code) is None:
             raise ValueError("forecast trace reason_code is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ForecastEvaluation:
+    """A completed, close-bounded evaluation of one persisted forecast."""
+
+    decision_date: date
+    strategy_id: str
+    instrument: InstrumentId
+    horizon: int
+    execution_date: date
+    evaluation_date: date
+    realized_close_return: float
+    tradable_return: float
+
+    def __post_init__(self) -> None:
+        _exact_date(self.decision_date, label="forecast evaluation decision_date")
+        _exact_date(self.execution_date, label="forecast evaluation execution_date")
+        _exact_date(self.evaluation_date, label="forecast evaluation evaluation_date")
+        if type(self.strategy_id) is not str or not self.strategy_id.strip():
+            raise ValueError("forecast evaluation strategy_id must be a non-empty string")
+        if type(self.instrument) is not InstrumentId:
+            raise TypeError("forecast evaluation instrument must be an exact InstrumentId")
+        if type(self.horizon) is not int or self.horizon <= 0:
+            raise ValueError("forecast evaluation horizon must be a positive integer")
+        if not self.decision_date < self.execution_date <= self.evaluation_date:
+            raise ValueError("forecast evaluation dates must follow decision chronology")
+        for label, value in (
+            ("realized_close_return", self.realized_close_return),
+            ("tradable_return", self.tradable_return),
+        ):
+            if type(value) is not float or not isfinite(value):
+                raise ValueError(f"forecast evaluation {label} must be a finite float")
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,6 +498,7 @@ class BacktestResult:
     used_profile_ids: tuple[str, ...]
     warnings: tuple[str, ...]
     forecast_traces: tuple[ForecastTrace, ...] = ()
+    forecast_evaluations: tuple[ForecastEvaluation, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.run_id) is not str or not self.run_id or self.run_id != self.run_id.strip():
@@ -472,6 +509,7 @@ class BacktestResult:
             ("ledger", self.ledger, LedgerSnapshot),
             ("risk_traces", self.risk_traces, RiskTrace),
             ("forecast_traces", self.forecast_traces, ForecastTrace),
+            ("forecast_evaluations", self.forecast_evaluations, ForecastEvaluation),
         )
         for label, values, item_type in expected:
             _validate_exact_tuple(label, values, item_type)
@@ -496,9 +534,34 @@ class BacktestResult:
         )
         if forecast_keys != tuple(sorted(set(forecast_keys))):
             raise ValueError("forecast traces must be unique and sorted")
+        forecast_by_key = {
+            (item.decision_date, item.strategy_id, item.instrument): item
+            for item in self.forecast_traces
+        }
+        evaluation_keys = tuple(
+            (item.decision_date, item.strategy_id, str(item.instrument))
+            for item in self.forecast_evaluations
+        )
+        if evaluation_keys != tuple(sorted(set(evaluation_keys))):
+            raise ValueError("forecast evaluations must be unique and sorted")
+        ledger_days_set = set(ledger_days)
+        for evaluation in self.forecast_evaluations:
+            trace = forecast_by_key.get(
+                (
+                    evaluation.decision_date,
+                    evaluation.strategy_id,
+                    evaluation.instrument,
+                )
+            )
+            if trace is None or trace.horizon != evaluation.horizon:
+                raise ValueError("forecast evaluation must match a forecast trace")
+            if (
+                evaluation.execution_date not in ledger_days_set
+                or evaluation.evaluation_date not in ledger_days_set
+            ):
+                raise ValueError("forecast evaluation dates must belong to the result ledger")
         orders_by_id = {order.order_id: order for order in self.orders}
         fills_by_order: dict[str, list[Fill]] = {}
-        ledger_days_set = set(ledger_days)
         previous_fill_day: date | None = None
         fill_order_keys: list[tuple[date, int, str, str]] = []
         for fill in self.fills:
@@ -530,11 +593,13 @@ class BacktestResult:
         if fill_order_keys != sorted(fill_order_keys):
             raise ValueError("fills must follow stable sell-before-buy ordering")
         risk_codes_by_decision: dict[tuple[date, InstrumentId], tuple[str, ...]] = {}
-        for trace in self.risk_traces:
-            key = (trace.decision_date, trace.instrument)
+        for risk_trace in self.risk_traces:
+            key = (risk_trace.decision_date, risk_trace.instrument)
             if key in risk_codes_by_decision:
                 raise ValueError("duplicate risk trace for decision date and instrument")
-            risk_codes_by_decision[key] = tuple(adjustment.code for adjustment in trace.adjustments)
+            risk_codes_by_decision[key] = tuple(
+                adjustment.code for adjustment in risk_trace.adjustments
+            )
         for order in self.orders:
             filled = sum(fill.quantity for fill in fills_by_order.get(order.order_id, ()))
             if filled != order.filled_quantity:
@@ -557,6 +622,8 @@ class BacktestResult:
             risk_trace.__post_init__()
         for forecast_trace in self.forecast_traces:
             forecast_trace.__post_init__()
+        for forecast_evaluation in self.forecast_evaluations:
+            forecast_evaluation.__post_init__()
 
 
 def _cell_decimal(value: object, *, label: str, optional: bool = False) -> Decimal | None:
@@ -652,6 +719,59 @@ def _source_target(
             if symbol_text in sleeve.final_weights and sleeve.final_weights[symbol_text] > 0
         }
     return DecisionTarget(weights, sleeves)
+
+
+def _forecast_evaluations(
+    request: BacktestRequest,
+    traces: Sequence[ForecastTrace],
+) -> tuple[ForecastEvaluation, ...]:
+    session_positions = {day: position for position, day in enumerate(request.sessions)}
+    evaluations: list[ForecastEvaluation] = []
+    execution_column = (
+        "open" if request.execution_timing is ExecutionTiming.NEXT_OPEN else "close"
+    )
+    for trace in traces:
+        decision_position = session_positions.get(trace.decision_date)
+        if (
+            decision_position is None
+            or decision_position + 1 >= len(request.sessions)
+            or decision_position + trace.horizon >= len(request.sessions)
+        ):
+            continue
+        execution_date = request.sessions[decision_position + 1]
+        evaluation_date = request.sessions[decision_position + trace.horizon]
+        frame = request._strategy_bars.get(trace.instrument)
+        if frame is None:
+            continue
+        execution_timestamp = pd.Timestamp(execution_date)
+        evaluation_timestamp = pd.Timestamp(evaluation_date)
+        if execution_timestamp not in frame.index or evaluation_timestamp not in frame.index:
+            continue
+        execution_price = float(
+            _positive_bar_decimal(
+                frame.at[execution_timestamp, execution_column],
+                label=f"forecast evaluation {execution_column}",
+            )
+        )
+        evaluation_close = float(
+            _positive_bar_decimal(
+                frame.at[evaluation_timestamp, "close"],
+                label="forecast evaluation close",
+            )
+        )
+        evaluations.append(
+            ForecastEvaluation(
+                decision_date=trace.decision_date,
+                strategy_id=trace.strategy_id,
+                instrument=trace.instrument,
+                horizon=trace.horizon,
+                execution_date=execution_date,
+                evaluation_date=evaluation_date,
+                realized_close_return=evaluation_close / trace.close - 1.0,
+                tradable_return=evaluation_close / execution_price - 1.0,
+            )
+        )
+    return tuple(evaluations)
 
 
 class BacktestEngine:
@@ -959,4 +1079,5 @@ class BacktestEngine:
             used_profile_ids=tuple(sorted(used_profiles)),
             warnings=tuple(sorted(warnings)),
             forecast_traces=tuple(forecast_traces),
+            forecast_evaluations=_forecast_evaluations(request, forecast_traces),
         )

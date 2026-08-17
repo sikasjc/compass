@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
+from hashlib import sha256
 import importlib
 from math import isfinite
 from threading import RLock
-from typing import Protocol
+from typing import ClassVar, Protocol
 
 import pandas as pd  # type: ignore[import-untyped]
 from pydantic import Field, model_validator
@@ -152,6 +154,13 @@ class KronosModelForecaster:
     """Lazy adapter around the optional Kronos model package and HF weights."""
 
     _inference_lock = RLock()
+    _forecast_cache: ClassVar[
+        OrderedDict[
+            tuple[str, str, str, int, int, float, float, int, int, str],
+            tuple[KronosForecast, ...],
+        ]
+    ] = OrderedDict()
+    _forecast_cache_limit = 512
 
     def __init__(
         self,
@@ -174,7 +183,31 @@ class KronosModelForecaster:
         else:
             self.device = device
         self._model_loader = model_loader or self._load_predictor
+        self._cache_namespace = (
+            "default" if model_loader is None else f"custom:{id(model_loader)}"
+        )
         self._predictor: object | None = None
+
+    @classmethod
+    def clear_forecast_cache(cls) -> None:
+        with cls._inference_lock:
+            cls._forecast_cache.clear()
+
+    @staticmethod
+    def _history_digest(
+        histories: Mapping[InstrumentId, pd.DataFrame],
+        ordered: Sequence[InstrumentId],
+        lookback: int,
+    ) -> str:
+        digest = sha256()
+        columns = ("open", "high", "low", "close", "volume", "amount")
+        for instrument in ordered:
+            frame = histories[instrument].tail(lookback).loc[:, columns]
+            digest.update(str(instrument).encode("utf-8"))
+            digest.update(
+                pd.util.hash_pandas_object(frame, index=True).values.tobytes()
+            )
+        return digest.hexdigest()
 
     def _load_predictor(self) -> object:
         try:
@@ -226,6 +259,23 @@ class KronosModelForecaster:
         if not histories:
             return ()
         ordered = tuple(sorted(histories, key=str))
+        cache_key = (
+            self._cache_namespace,
+            self.model_size,
+            self.device,
+            lookback,
+            horizon,
+            temperature,
+            top_p,
+            sample_count,
+            seed,
+            f"{as_of.isoformat()}:{self._history_digest(histories, ordered, lookback)}",
+        )
+        with self._inference_lock:
+            cached = self._forecast_cache.get(cache_key)
+            if cached is not None:
+                self._forecast_cache.move_to_end(cache_key)
+                return cached
         prepared: list[pd.DataFrame] = []
         x_timestamps: list[pd.Series] = []
         y_timestamps: list[pd.Series] = []
@@ -251,6 +301,10 @@ class KronosModelForecaster:
         except (AttributeError, ImportError) as error:
             raise KronosRuntimeUnavailable("KRONOS_TORCH_UNAVAILABLE") from error
         with self._inference_lock:
+            cached = self._forecast_cache.get(cache_key)
+            if cached is not None:
+                self._forecast_cache.move_to_end(cache_key)
+                return cached
             manual_seed(seed)
             cuda = getattr(torch, "cuda", None)
             cuda_seed = None if cuda is None else getattr(cuda, "manual_seed_all", None)
@@ -283,7 +337,13 @@ class KronosModelForecaster:
                     predicted_closes=closes,
                 )
             )
-        return tuple(result)
+        forecasts = tuple(result)
+        with self._inference_lock:
+            self._forecast_cache[cache_key] = forecasts
+            self._forecast_cache.move_to_end(cache_key)
+            while len(self._forecast_cache) > self._forecast_cache_limit:
+                self._forecast_cache.popitem(last=False)
+        return forecasts
 
 
 def _mps_available() -> bool:

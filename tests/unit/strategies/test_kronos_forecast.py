@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
 from compass.domain.market import AssetType, InstrumentId
 from compass.strategies.base import HoldingSummary, StrategyContext, StrategyDecisionStatus
+import compass.strategies.kronos_forecast as kronos_module
 from compass.strategies.kronos_forecast import (
     KronosForecast,
+    KronosModelForecaster,
     KronosForecastParameters,
     KronosForecastStrategy,
     KronosRuntimeStatus,
@@ -190,3 +193,63 @@ def test_kronos_runtime_status_explains_cuda_and_cpu() -> None:
     assert cpu.display_text == "当前仅 CPU · PyTorch 2.13.0+cpu"
     assert cuda.action_text is None
     assert cpu.action_text is not None
+
+
+def test_model_forecaster_reuses_identical_inference_across_instances(monkeypatch) -> None:
+    class Predictor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def predict_batch(self, *, df_list, pred_len, **kwargs):  # type: ignore[no-untyped-def]
+            del kwargs
+            self.calls += 1
+            return [
+                pd.DataFrame(
+                    {
+                        "close": [
+                            float(frame["close"].iloc[-1]) * (1 + 0.01 * step)
+                            for step in range(1, pred_len + 1)
+                        ]
+                    }
+                )
+                for frame in df_list
+            ]
+
+    predictor = Predictor()
+    loader_calls = 0
+
+    def loader() -> object:
+        nonlocal loader_calls
+        loader_calls += 1
+        return predictor
+
+    fake_torch = SimpleNamespace(
+        manual_seed=lambda seed: None,
+        cuda=SimpleNamespace(manual_seed_all=lambda seed: None),
+    )
+    original_import = kronos_module.importlib.import_module
+    monkeypatch.setattr(
+        kronos_module.importlib,
+        "import_module",
+        lambda name: fake_torch if name == "torch" else original_import(name),
+    )
+    KronosModelForecaster.clear_forecast_cache()
+    first = KronosModelForecaster(device="cpu", model_loader=loader)
+    second = KronosModelForecaster(device="cpu", model_loader=loader)
+    history = {FIRST: bars(periods=64)}
+    arguments = {
+        "as_of": history[FIRST].index[-1].date(),
+        "lookback": 64,
+        "horizon": 3,
+        "temperature": 0.8,
+        "top_p": 0.9,
+        "sample_count": 2,
+        "seed": 7,
+    }
+
+    first_result = first.forecast(history, **arguments)
+    second_result = second.forecast(history, **arguments)
+
+    assert second_result == first_result
+    assert predictor.calls == 1
+    assert loader_calls == 1

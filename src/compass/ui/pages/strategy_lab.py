@@ -753,6 +753,10 @@ _FORECAST_REASON_LABELS = {
 
 
 def _forecast_trace_rows(report: BacktestReport) -> list[dict[str, object]]:
+    evaluations = {
+        (item.decision_date, item.strategy_id, item.instrument): item
+        for item in report.result.forecast_evaluations
+    }
     return [
         {
             "id": (
@@ -764,6 +768,21 @@ def _forecast_trace_rows(report: BacktestReport) -> list[dict[str, object]]:
             "instrument": str(item.instrument),
             "rank": item.rank,
             "return": f"{item.expected_return * 100:.2f}%",
+            "actual": (
+                "—"
+                if (
+                    evaluation := evaluations.get(
+                        (item.decision_date, item.strategy_id, item.instrument)
+                    )
+                )
+                is None
+                else f"{evaluation.realized_close_return * 100:.2f}%"
+            ),
+            "tradable": (
+                "—"
+                if evaluation is None
+                else f"{evaluation.tradable_return * 100:.2f}%"
+            ),
             "positive": f"{item.path_positive_ratio * 100:.0f}%",
             "trend": "通过" if item.trend_passed else "未通过",
             "action": _FORECAST_ACTION_LABELS[item.action],
@@ -1846,8 +1865,26 @@ def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
             if forecast_rows:
                 ui.label("Kronos 预测诊断").classes("text-base font-semibold mt-2")
                 ui.label(
-                    "只记录 Kronos 实际重新预测的交易日；策略内仓位还会乘以该策略的资金占比，形成组合最终仓位。"
+                    "实际收益按预测周期末收盘计算；可交易收益按下一执行价至周期末收盘计算。"
                 ).classes("text-xs text-slate-500")
+                quality = report.forecast_quality
+                with ui.row().classes("w-full gap-3"):
+                    quality_metrics = (
+                        ("已评估", f"{quality.evaluated_count}/{quality.forecast_count}"),
+                        ("方向命中", _percent(quality.direction_accuracy)),
+                        ("收益相关", _number(quality.return_correlation)),
+                        ("全体可交易均值", _percent(quality.mean_tradable_return)),
+                        (
+                            "入选标的均值",
+                            _percent(quality.selected_mean_tradable_return),
+                        ),
+                    )
+                    for label, value in quality_metrics:
+                        with ui.card().classes(
+                            "min-w-32 border border-slate-100 bg-slate-50 shadow-none"
+                        ):
+                            ui.label(label).classes("text-xs text-slate-500")
+                            ui.label(value).classes("font-semibold")
                 ui.table(
                     columns=[
                         {"name": "date", "label": "预测日", "field": "date"},
@@ -1855,6 +1892,12 @@ def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
                         {"name": "instrument", "label": "标的", "field": "instrument"},
                         {"name": "rank", "label": "排名", "field": "rank"},
                         {"name": "return", "label": "预测收益", "field": "return"},
+                        {"name": "actual", "label": "实际收益", "field": "actual"},
+                        {
+                            "name": "tradable",
+                            "label": "可交易收益",
+                            "field": "tradable",
+                        },
                         {
                             "name": "positive",
                             "label": "路径看涨比例",
