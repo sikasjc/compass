@@ -43,9 +43,13 @@ from compass.strategies.dual_ma import DualMaParameters
 from compass.strategies.indicators import simple_moving_average
 from compass.strategies.kronos_forecast import KronosForecastStrategy
 from compass.strategies.rule_dsl import (
+    DslExecutableRule,
     RuleDslParameters,
+    RuleDslState,
     compile_rule,
+    dsl_action_target,
     required_history as dsl_required_history,
+    rule_dsl_state,
 )
 from compass.ui.pages.backtests import BacktestReport
 from compass.ui.pages.strategy_lab import (
@@ -150,15 +154,19 @@ class _CombinedStrategyDecisionSource:
                 buy_expression=strategy.buy_expression,
                 sell_expression=strategy.sell_expression,
                 variables=strategy.variables,
+                rules=strategy.dsl_rules,
                 target_weight=Decimal("1"),
             )
             for strategy in self._strategies
             if strategy.strategy is StrategyLabKind.RULE_DSL
         }
         self._rule_programs = {
-            strategy_id: (
-                compile_rule(parameters.buy_expression, tuple(parameters.variable_values)),
-                compile_rule(parameters.sell_expression, tuple(parameters.variable_values)),
+            strategy_id: tuple(
+                (
+                    rule,
+                    compile_rule(rule.expression, tuple(parameters.variable_values)),
+                )
+                for rule in parameters.executable_rules
             )
             for strategy_id, parameters in self._rule_parameters.items()
         }
@@ -184,23 +192,6 @@ class _CombinedStrategyDecisionSource:
         if strategy.strategy is StrategyLabKind.BUY_AND_HOLD:
             return True
         assert strategy.signal_instrument is not None
-        if strategy.strategy is StrategyLabKind.RULE_DSL:
-            dsl_parameters = self._rule_parameters[strategy.strategy_id]
-            history = context.history(strategy.signal_instrument)
-            needed = dsl_required_history(
-                (dsl_parameters.buy_expression, dsl_parameters.sell_expression),
-                dsl_parameters.variable_values,
-            )
-            held = any(
-                (holding := context.holding(instrument)) is not None and holding.quantity > 0
-                for instrument in strategy.instruments
-            )
-            if len(history) < needed:
-                return held
-            buy, sell = self._rule_programs[strategy.strategy_id]
-            if sell.evaluate(history, dsl_parameters.variable_values):
-                return False
-            return buy.evaluate(history, dsl_parameters.variable_values) or held
         ma_parameters = self._parameters[strategy.strategy_id]
         close = context.history(strategy.signal_instrument)["close"]
         required_history = ma_parameters.long_window + ma_parameters.confirmation_days - 1
@@ -213,6 +204,78 @@ class _CombinedStrategyDecisionSource:
         return (
             not recent.isna().any() and isfinite(float(long.iloc[-1])) and bool((recent > 0).all())
         )
+
+    @staticmethod
+    def _dsl_state(strategy: StrategyLegConfiguration, context: StrategyContext) -> RuleDslState:
+        held = tuple(
+            holding
+            for instrument in strategy.instruments
+            if (holding := context.holding(instrument)) is not None and holding.quantity > 0
+        )
+        if not held:
+            return RuleDslState()
+        current_value = sum(
+            (holding.mark_price * holding.quantity for holding in held),
+            Decimal("0"),
+        )
+        cost_basis = sum(
+            (holding.average_cost * holding.quantity for holding in held),
+            Decimal("0"),
+        )
+        individual = tuple(
+            rule_dsl_state(
+                context.history(holding.instrument),
+                context.as_of,
+                holding,
+            )
+            for holding in held
+        )
+        return RuleDslState(
+            True,
+            max(item.holding_days for item in individual),
+            0.0 if cost_basis <= 0 else float(current_value / cost_basis - Decimal("1")),
+            min(item.position_drawdown for item in individual),
+        )
+
+    def _dsl_target(
+        self,
+        strategy: StrategyLegConfiguration,
+        context: StrategyContext,
+    ) -> tuple[Decimal, DslExecutableRule | None]:
+        assert strategy.signal_instrument is not None
+        parameters = self._rule_parameters[strategy.strategy_id]
+        history = context.history(strategy.signal_instrument)
+        needed = dsl_required_history(
+            tuple(item.expression for item in parameters.executable_rules),
+            parameters.variable_values,
+        )
+        current_value = sum(
+            (
+                holding.mark_price * holding.quantity
+                for instrument in strategy.instruments
+                if (holding := context.holding(instrument)) is not None
+            ),
+            Decimal("0"),
+        )
+        current_weight = (
+            Decimal("0")
+            if context.account_equity <= 0
+            else min(
+                Decimal("1"),
+                current_value / context.account_equity / strategy.budget,
+            )
+        )
+        if len(history) < needed:
+            return current_weight, None
+        state = self._dsl_state(strategy, context)
+        matched = tuple(
+            rule
+            for rule, program in self._rule_programs[strategy.strategy_id]
+            if program.evaluate(history, parameters.variable_values, state)
+        )
+        if not matched:
+            return current_weight, None
+        return dsl_action_target(matched[0], current_weight), matched[0]
 
     def _is_rebalance_session(self, context: StrategyContext) -> bool:
         if self._last_requested_weights is None:
@@ -334,22 +397,34 @@ class _CombinedStrategyDecisionSource:
                     ].latest_diagnostics
                 )
                 continue
-            active = self._active(strategy, context)
+            dsl_target = Decimal("0")
+            dsl_rule: DslExecutableRule | None = None
+            if strategy.strategy is StrategyLabKind.RULE_DSL:
+                dsl_target, dsl_rule = self._dsl_target(strategy, context)
+                active = dsl_target > 0
+            else:
+                active = self._active(strategy, context)
             for instrument, weight in self._weights[strategy.strategy_id].items():
                 intents.append(
                     TargetIntent(
                         strategy_id=strategy.strategy_id,
                         instrument=instrument,
-                        target_weight=weight if active else Decimal("0"),
+                        target_weight=(
+                            weight * dsl_target
+                            if strategy.strategy is StrategyLabKind.RULE_DSL
+                            else weight
+                            if active
+                            else Decimal("0")
+                        ),
                         score=1.0 if active else 0.0,
                         confidence=1.0,
                         reason_code=(
                             "BUY_AND_HOLD_TARGET"
                             if strategy.strategy is StrategyLabKind.BUY_AND_HOLD
-                            else "RULE_DSL_RISK_ON"
-                            if strategy.strategy is StrategyLabKind.RULE_DSL and active
-                            else "RULE_DSL_RISK_OFF"
-                            if strategy.strategy is StrategyLabKind.RULE_DSL
+                            else "RULE_DSL_HOLD"
+                            if strategy.strategy is StrategyLabKind.RULE_DSL and dsl_rule is None
+                            else f"RULE_DSL_{dsl_rule.action.value.upper()}"
+                            if strategy.strategy is StrategyLabKind.RULE_DSL and dsl_rule is not None
                             else "DUAL_MA_RISK_ON"
                             if active
                             else "DUAL_MA_RISK_OFF"
@@ -682,6 +757,9 @@ class LocalStrategyLabGateway:
                         "sell_expression": strategy.sell_expression,
                         "variables": tuple(
                             item.model_dump(mode="json") for item in strategy.variables
+                        ),
+                        "dsl_rules": tuple(
+                            item.model_dump(mode="json") for item in strategy.dsl_rules
                         ),
                         "kronos_parameters": (
                             None

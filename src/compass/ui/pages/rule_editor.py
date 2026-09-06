@@ -14,7 +14,7 @@ from compass.strategies.rule_document import (
     StrategyRuleDocument,
     document_required_fields,
 )
-from compass.strategies.rule_dsl import DslVariable
+from compass.strategies.rule_dsl import DslAction, DslVariable
 from compass.ui.pages.strategies import (
     StrategyPageError,
     StrategyPageModel,
@@ -219,6 +219,13 @@ def render_rule_editor_page(model: StrategyPageModel | None) -> None:
     def add_rule(rule: StrategyRule | None = None, *, side_value: RuleSide = RuleSide.BUY) -> None:
         rule_counter[0] += 1
         selected_side = rule.side if rule is not None else side_value
+        selected_action = (
+            rule.action
+            if rule is not None and rule.action is not None
+            else DslAction.TARGET_WEIGHT
+            if selected_side is RuleSide.BUY
+            else DslAction.SELL_ALL
+        )
         rule_id = rule.rule_id if rule is not None else f"rule_{rule_counter[0]}"
         with rules_container:
             card = ui.card().classes("w-full border border-slate-200 shadow-none")
@@ -230,9 +237,15 @@ def render_rule_editor_page(model: StrategyPageModel | None) -> None:
                         if rule is not None
                         else ("新增买入条件" if selected_side is RuleSide.BUY else "新增卖出条件"),
                     )
-                    side = ui.select(
-                        {RuleSide.BUY.value: "买入/进入", RuleSide.SELL.value: "卖出/退出"},
-                        value=selected_side.value,
+                    action = ui.select(
+                        {
+                            DslAction.TARGET_WEIGHT.value: "调整到目标仓位",
+                            DslAction.INCREASE_BY.value: "增加仓位",
+                            DslAction.REDUCE_TO.value: "减仓到",
+                            DslAction.SELL_ALL.value: "全部卖出",
+                            DslAction.HOLD.value: "保持仓位",
+                        },
+                        value=selected_action.value,
                         label="动作",
                     )
                     priority = ui.number(
@@ -243,11 +256,11 @@ def render_rule_editor_page(model: StrategyPageModel | None) -> None:
                         step=10,
                     )
                     target = ui.number(
-                        "目标仓位（%，仅买入）",
+                        "动作数值（%，调仓/加减仓时填写）",
                         value=(
                             float(rule.target_weight * 100)
                             if rule is not None and rule.target_weight is not None
-                            else (100 if selected_side is RuleSide.BUY else None)
+                            else (100 if selected_action is DslAction.TARGET_WEIGHT else None)
                         ),
                         min=1,
                         max=100,
@@ -264,12 +277,14 @@ def render_rule_editor_page(model: StrategyPageModel | None) -> None:
                 ).classes("w-full font-mono")
                 ui.label(
                     "可用：open/high/low/close/volume/amount、sma、rsi、pct_change、"
-                    "highest、lowest、cross_above、cross_below 以及 and/or/not。"
+                    "highest、lowest、cross_above、cross_below、has_position、holding_days、"
+                    "position_return、position_drawdown 以及 and/or/not。"
                 ).classes("text-xs text-slate-500")
         controls = {
             "rule_id": rule_id,
             "name": name,
-            "side": side,
+            "action": action,
+            "default_side": selected_side,
             "priority": priority,
             "target": target,
             "expression": expression,
@@ -366,10 +381,22 @@ def render_rule_editor_page(model: StrategyPageModel | None) -> None:
         )
         rules = []
         for item in rule_controls:
-            selected_side = RuleSide(str(item["side"].value))
+            selected_action = DslAction(str(item["action"].value))
+            selected_side = (
+                RuleSide.BUY
+                if selected_action in {DslAction.TARGET_WEIGHT, DslAction.INCREASE_BY}
+                else RuleSide.SELL
+                if selected_action in {DslAction.REDUCE_TO, DslAction.SELL_ALL}
+                else item["default_side"]
+            )
             target_value = item["target"].value
-            if selected_side is RuleSide.BUY and target_value is None:
-                raise ValueError("买入规则必须填写目标仓位")
+            needs_value = selected_action in {
+                DslAction.TARGET_WEIGHT,
+                DslAction.INCREASE_BY,
+                DslAction.REDUCE_TO,
+            }
+            if needs_value and target_value is None:
+                raise ValueError("调仓、加仓或减仓动作必须填写仓位数值")
             rules.append(
                 StrategyRule(
                     rule_id=item["rule_id"],
@@ -377,9 +404,10 @@ def render_rule_editor_page(model: StrategyPageModel | None) -> None:
                     side=selected_side,
                     priority=int(item["priority"].value),
                     expression=str(item["expression"].value),
+                    action=selected_action,
                     target_weight=(
                         Decimal(str(target_value)) / Decimal("100")
-                        if selected_side is RuleSide.BUY
+                        if needs_value
                         else None
                     ),
                 )
@@ -462,8 +490,15 @@ def render_rule_preview_page(model: StrategyPageModel | None) -> None:
                 rows = [
                     {
                         "day": str(item.day),
-                        "side": "B 买入" if item.side is RuleSide.BUY else "S 卖出",
+                        "side": {
+                            DslAction.TARGET_WEIGHT: "B 调整仓位",
+                            DslAction.INCREASE_BY: "B 加仓",
+                            DslAction.REDUCE_TO: "S 减仓",
+                            DslAction.SELL_ALL: "S 全部卖出",
+                            DslAction.HOLD: "— 保持",
+                        }[item.action],
                         "rule": item.rule_name,
+                        "overridden": "、".join(item.overridden_rule_ids) or "—",
                         "close": str(item.close),
                         "target": f"{item.target_weight * 100}%",
                         "execution": draft.document.execute.value,
@@ -475,6 +510,7 @@ def render_rule_preview_page(model: StrategyPageModel | None) -> None:
                         {"name": "day", "label": "日期", "field": "day"},
                         {"name": "side", "label": "信号", "field": "side"},
                         {"name": "rule", "label": "命中规则", "field": "rule"},
+                        {"name": "overridden", "label": "被覆盖规则", "field": "overridden"},
                         {"name": "close", "label": "收盘价", "field": "close"},
                         {"name": "target", "label": "目标仓位", "field": "target"},
                         {"name": "execution", "label": "计划执行", "field": "execution"},

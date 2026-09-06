@@ -7,12 +7,16 @@ import pandas as pd
 import pytest
 
 from compass.domain.market import AssetType, InstrumentId
-from compass.strategies.base import StrategyContext, StrategyDecisionStatus
+from compass.strategies.base import HoldingSummary, StrategyContext, StrategyDecisionStatus
 from compass.strategies.rule_dsl import (
+    DslAction,
+    DslExecutableRule,
     DslVariable,
     RuleDslParameters,
+    RuleDslState,
     RuleDslStrategy,
     compile_rule,
+    dsl_action_target,
 )
 
 
@@ -102,3 +106,86 @@ def test_rule_dsl_strategy_generates_buy_target_without_eval() -> None:
     assert decision[0].instrument == INSTRUMENT
     assert decision[0].target_weight == Decimal("1")
     assert decision[0].reason_code == "DSL_BUY"
+
+
+def test_rule_dsl_exposes_position_state_without_allowing_variable_shadowing() -> None:
+    program = compile_rule(
+        "has_position and holding_days >= 3 and position_return < -0.05",
+        (),
+    )
+
+    assert program.evaluate(
+        bars(),
+        {},
+        RuleDslState(True, 4, -0.10, -0.12),
+    )
+    with pytest.raises(ValueError, match="non-reserved"):
+        variable("holding_days", "2", "1", "3")
+
+
+def test_rule_dsl_executes_highest_priority_action_and_records_conflicts() -> None:
+    configured = RuleDslParameters(
+        buy_expression="close > 0",
+        sell_expression="position_return < -0.05",
+        rules=(
+            DslExecutableRule(
+                rule_id="stop_loss",
+                name="止损",
+                priority=300,
+                expression="position_return < -0.05",
+                action=DslAction.SELL_ALL,
+            ),
+            DslExecutableRule(
+                rule_id="trend_entry",
+                name="趋势进入",
+                priority=100,
+                expression="close > 0",
+                action=DslAction.TARGET_WEIGHT,
+                value=Decimal("0.8"),
+            ),
+        ),
+    )
+    strategy = RuleDslStrategy(configured, strategy_id="position-actions")
+    context = StrategyContext(
+        as_of=date(2026, 8, 6),
+        bars={INSTRUMENT: bars()},
+        instruments=(INSTRUMENT,),
+        account_equity=Decimal("100000"),
+        holdings={
+            INSTRUMENT: HoldingSummary(
+                INSTRUMENT,
+                100,
+                100,
+                Decimal("4"),
+                Decimal("3"),
+                date(2026, 8, 3),
+            )
+        },
+        asset_types={INSTRUMENT: AssetType.ETF},
+    )
+
+    decision = strategy.generate_targets(context)
+
+    assert decision[0].target_weight == Decimal("0")
+    assert decision[0].reason_code == "DSL_SELL"
+    trace = decision.details["rule_traces"][0]  # type: ignore[index]
+    assert trace["selected_rule_id"] == "stop_loss"  # type: ignore[index]
+    assert trace["overridden_rule_ids"] == ("trend_entry",)  # type: ignore[index]
+
+
+def test_dsl_position_actions_are_bounded_and_directional() -> None:
+    increase = DslExecutableRule(
+        rule_id="increase",
+        name="加仓",
+        priority=100,
+        expression="close > 0",
+        action=DslAction.INCREASE_BY,
+        value=Decimal("0.3"),
+    )
+    reduce = increase.model_copy(
+        update={"rule_id": "reduce", "action": DslAction.REDUCE_TO, "value": Decimal("0.4")}
+    )
+
+    assert dsl_action_target(increase, Decimal("0.8")) == Decimal("1")
+    assert dsl_action_target(reduce, Decimal("0.7")) == Decimal("0.4")
+    assert dsl_action_target(reduce, Decimal("0.2")) == Decimal("0.2")

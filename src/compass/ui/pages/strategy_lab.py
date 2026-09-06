@@ -18,7 +18,7 @@ from compass.domain.market import AssetType, InstrumentId
 from compass.services.instrument_names import common_index_etf_pairs, common_instrument_name
 from compass.services.safe_display import safe_display_text, safe_identifier, stable_code
 from compass.services.task_manager import Operation, TaskSnapshot, TaskStatus
-from compass.strategies.rule_dsl import DslVariable, RuleDslParameters
+from compass.strategies.rule_dsl import DslExecutableRule, DslVariable, RuleDslParameters
 from compass.strategies.kronos_forecast import KronosForecastParameters, kronos_runtime_status
 from compass.ui.components.charts import CurvePoint, equity_chart_options, thaw_chart_options
 from compass.ui.pages.backtests import BacktestReport
@@ -110,6 +110,7 @@ class StrategyLegConfiguration:
     buy_expression: str = ""
     sell_expression: str = ""
     variables: tuple[DslVariable, ...] = ()
+    dsl_rules: tuple[DslExecutableRule, ...] = ()
     kronos_parameters: KronosForecastParameters | None = None
     template_instance_id: str | None = None
     template_name: str | None = None
@@ -144,13 +145,20 @@ class StrategyLegConfiguration:
         if any(type(item) is not DslVariable for item in variables):
             raise TypeError("DSL variables must contain exact DslVariable values")
         object.__setattr__(self, "variables", variables)
+        dsl_rules = tuple(self.dsl_rules)
+        if any(type(item) is not DslExecutableRule for item in dsl_rules):
+            raise TypeError("DSL rules must contain exact DslExecutableRule values")
+        object.__setattr__(self, "dsl_rules", dsl_rules)
         if self.strategy is StrategyLabKind.RULE_DSL:
             RuleDslParameters(
                 buy_expression=self.buy_expression,
                 sell_expression=self.sell_expression,
                 variables=variables,
+                rules=dsl_rules,
                 target_weight=Decimal("1"),
             )
+        elif dsl_rules:
+            raise ValueError("only DSL strategy may define DSL rules")
         if self.strategy is StrategyLabKind.KRONOS_FORECAST:
             if self.kronos_parameters is None:
                 raise ValueError("Kronos strategy requires Kronos parameters")
@@ -677,8 +685,22 @@ def _strategy_rule_text(report: BacktestReport, sleeve_ids: Sequence[str], side:
         if snapshot is None:
             continue
         if snapshot.strategy_type == StrategyLabKind.RULE_DSL.value:
-            key = "buy_expression" if side == "buy" else "sell_expression"
-            rules.append(f"{sleeve_id}: {snapshot.parameters.get(key, '—')}")
+            raw_rules = snapshot.parameters.get("dsl_rules", ())
+            selected_actions = (
+                {"target_weight", "increase_by"}
+                if side == "buy"
+                else {"reduce_to", "sell_all"}
+            )
+            matching = tuple(
+                str(item.get("name", item.get("rule_id", "规则")))
+                for item in raw_rules
+                if isinstance(item, Mapping) and item.get("action") in selected_actions
+            ) if isinstance(raw_rules, Sequence) else ()
+            if matching:
+                rules.append(f"{sleeve_id}: {'、'.join(matching)}")
+            else:
+                key = "buy_expression" if side == "buy" else "sell_expression"
+                rules.append(f"{sleeve_id}: {snapshot.parameters.get(key, '—')}")
         elif snapshot.strategy_type == StrategyLabKind.DUAL_MA.value:
             short = snapshot.parameters.get("short_window", 20)
             long = snapshot.parameters.get("long_window", 60)
@@ -1122,9 +1144,16 @@ def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
                         exported = "、".join(
                             item.name for item in strategy.variables if item.optimize
                         )
+                        rule_summary = (
+                            "、".join(
+                                f"{item.name}（{item.action.value}）"
+                                for item in strategy.dsl_rules
+                            )
+                            if strategy.dsl_rules
+                            else f"买入 {strategy.buy_expression} · 卖出 {strategy.sell_expression}"
+                        )
                         ui.label(
-                            f"信号：{by_id[str(strategy.signal_instrument)].label} · "
-                            f"买入 {strategy.buy_expression} · 卖出 {strategy.sell_expression}"
+                            f"信号：{by_id[str(strategy.signal_instrument)].label} · {rule_summary}"
                         ).classes("text-xs text-slate-500")
                         ui.label(f"导出变量：{exported or '无'}").classes("text-xs text-indigo-700")
                     elif strategy.strategy is StrategyLabKind.KRONOS_FORECAST:
@@ -1187,6 +1216,29 @@ def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
                             ),
                             strict=True,
                         ).variables
+                    ),
+                    dsl_rules=(
+                        ()
+                        if kind is not StrategyLabKind.RULE_DSL
+                        else RuleDslParameters.model_validate_json(
+                            json.dumps(
+                                {
+                                    "buy_expression": str(
+                                        getattr(draft_controls["buy_expression"], "value")
+                                    ),
+                                    "sell_expression": str(
+                                        getattr(draft_controls["sell_expression"], "value")
+                                    ),
+                                    "variables": json.loads(
+                                        str(getattr(draft_controls["variables"], "value"))
+                                    ),
+                                    "rules": draft_controls.get("dsl_rules", ()),
+                                    "target_weight": "1",
+                                },
+                                ensure_ascii=False,
+                            ),
+                            strict=True,
+                        ).rules
                     ),
                     kronos_parameters=(
                         None
@@ -1314,7 +1366,14 @@ def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
                         step=1,
                     )
             if kind is StrategyLabKind.RULE_DSL:
-                draft_controls["buy_expression"] = ui.textarea(
+                editable_rules = _editable_json(parameters.get("rules", ()))
+                raw_rules = editable_rules if isinstance(editable_rules, list) else []
+                draft_controls["dsl_rules"] = raw_rules
+                if raw_rules:
+                    ui.label(
+                        f"使用模板中的 {len(raw_rules)} 条分级仓位规则；如需修改动作或条件，请回到策略实验室创建新版本。"
+                    ).classes("text-sm text-indigo-700")
+                buy_control = ui.textarea(
                     "买入 DSL",
                     value=str(
                         parameters.get(
@@ -1323,7 +1382,7 @@ def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
                         )
                     ),
                 ).classes("w-full font-mono")
-                draft_controls["sell_expression"] = ui.textarea(
+                sell_control = ui.textarea(
                     "卖出 DSL",
                     value=str(
                         parameters.get(
@@ -1332,6 +1391,11 @@ def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
                         )
                     ),
                 ).classes("w-full font-mono")
+                if raw_rules:
+                    buy_control.props("readonly")
+                    sell_control.props("readonly")
+                draft_controls["buy_expression"] = buy_control
+                draft_controls["sell_expression"] = sell_control
                 draft_controls["variables"] = ui.textarea(
                     "导出变量 JSON",
                     value=json.dumps(

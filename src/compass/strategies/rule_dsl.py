@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
+from enum import StrEnum
 from math import isfinite
 import re
 from typing import Literal, cast
@@ -14,6 +17,7 @@ from compass.domain.market import AssetType, InstrumentId
 from compass.domain.trading import TargetIntent
 from compass.domain.weights import weight_to_units
 from compass.strategies.base import (
+    HoldingSummary,
     StrategyContext,
     StrategyDecision,
     StrategyDecisionStatus,
@@ -22,15 +26,14 @@ from compass.strategies.base import (
     StrategyParameters,
 )
 from compass.strategies.indicators import rsi, simple_moving_average
-from compass.strategies.momentum import (
-    _equal_weights,
-    _normalize_strategy_id,
-    _prepare_context,
-)
+from compass.strategies.momentum import _normalize_strategy_id, _prepare_context
 
 
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]*$")
 _FIELDS = frozenset({"open", "high", "low", "close", "volume", "amount"})
+_STATE_FIELDS = frozenset(
+    {"has_position", "holding_days", "position_return", "position_drawdown"}
+)
 _FUNCTION_ARITY = {
     "cross_above": 2,
     "cross_below": 2,
@@ -40,10 +43,71 @@ _FUNCTION_ARITY = {
     "rsi": 2,
     "sma": 2,
 }
-_RESERVED = _FIELDS | frozenset(_FUNCTION_ARITY)
+_RESERVED = _FIELDS | _STATE_FIELDS | frozenset(_FUNCTION_ARITY)
 _MAX_EXPRESSION_LENGTH = 2_048
 _MAX_AST_NODES = 384
 _MAX_WINDOW = 10_000
+
+
+class DslAction(StrEnum):
+    TARGET_WEIGHT = "target_weight"
+    REDUCE_TO = "reduce_to"
+    INCREASE_BY = "increase_by"
+    SELL_ALL = "sell_all"
+    HOLD = "hold"
+
+
+class DslExecutableRule(StrategyParameters):
+    rule_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")
+    name: str = Field(min_length=1, max_length=80)
+    priority: int = Field(strict=True, ge=1, le=10_000)
+    expression: str = Field(min_length=1, max_length=_MAX_EXPRESSION_LENGTH)
+    action: DslAction
+    value: Decimal | None = Field(
+        default=None,
+        strict=True,
+        allow_inf_nan=False,
+        gt=0,
+        le=1,
+    )
+
+    @model_validator(mode="after")
+    def validate_action(self) -> DslExecutableRule:
+        needs_value = self.action in {
+            DslAction.TARGET_WEIGHT,
+            DslAction.REDUCE_TO,
+            DslAction.INCREASE_BY,
+        }
+        if needs_value != (self.value is not None):
+            raise ValueError("DSL action value does not match action type")
+        return self
+
+
+@dataclass(frozen=True, slots=True)
+class RuleDslState:
+    has_position: bool = False
+    holding_days: int = 0
+    position_return: float = 0.0
+    position_drawdown: float = 0.0
+
+    def __post_init__(self) -> None:
+        if type(self.has_position) is not bool:
+            raise TypeError("DSL has_position must be an exact bool")
+        if type(self.holding_days) is not int or self.holding_days < 0:
+            raise ValueError("DSL holding_days must be a non-negative integer")
+        if not isfinite(self.position_return) or not isfinite(self.position_drawdown):
+            raise ValueError("DSL position state must be finite")
+        if self.position_drawdown > 0:
+            raise ValueError("DSL position_drawdown must not be positive")
+
+    @property
+    def values(self) -> Mapping[str, bool | int | float]:
+        return {
+            "has_position": self.has_position,
+            "holding_days": self.holding_days,
+            "position_return": self.position_return,
+            "position_drawdown": self.position_drawdown,
+        }
 
 
 class DslVariable(StrategyParameters):
@@ -91,6 +155,11 @@ class RuleDslParameters(StrategyParameters):
         max_length=32,
         description="可修改、可导出给回测和优化器的变量定义。",
     )
+    rules: tuple[DslExecutableRule, ...] = Field(
+        default=(),
+        max_length=32,
+        description="按优先级执行的仓位动作规则；为空时兼容旧版买入/卖出表达式。",
+    )
     target_weight: Decimal = Field(
         default=Decimal("1"),
         strict=True,
@@ -111,8 +180,17 @@ class RuleDslParameters(StrategyParameters):
             raise ValueError("DSL variable names must be unique")
         compile_rule(self.buy_expression, names)
         compile_rule(self.sell_expression, names)
+        rule_ids = tuple(item.rule_id for item in self.rules)
+        if len(set(rule_ids)) != len(rule_ids):
+            raise ValueError("DSL executable rule ids must be unique")
+        for rule in self.rules:
+            compile_rule(rule.expression, names)
         required_history(
-            (self.buy_expression, self.sell_expression),
+            (
+                tuple(item.expression for item in self.rules)
+                if self.rules
+                else (self.buy_expression, self.sell_expression)
+            ),
             {item.name: item.value for item in self.variables},
         )
         weight_to_units(self.target_weight, label="target_weight")
@@ -125,6 +203,37 @@ class RuleDslParameters(StrategyParameters):
     @property
     def optimization_variables(self) -> tuple[DslVariable, ...]:
         return tuple(item for item in self.variables if item.optimize)
+
+    @property
+    def executable_rules(self) -> tuple[DslExecutableRule, ...]:
+        if self.rules:
+            return tuple(
+                sorted(
+                    self.rules,
+                    key=lambda item: (
+                        -item.priority,
+                        item.action in {DslAction.TARGET_WEIGHT, DslAction.INCREASE_BY},
+                        item.rule_id,
+                    ),
+                )
+            )
+        return (
+            DslExecutableRule(
+                rule_id="legacy_sell",
+                name="卖出条件",
+                priority=200,
+                expression=self.sell_expression,
+                action=DslAction.SELL_ALL,
+            ),
+            DslExecutableRule(
+                rule_id="legacy_buy",
+                name="买入条件",
+                priority=100,
+                expression=self.buy_expression,
+                action=DslAction.TARGET_WEIGHT,
+                value=self.target_weight,
+            ),
+        )
 
 
 class RuleDslProgram:
@@ -148,6 +257,7 @@ class RuleDslProgram:
         self,
         frame: pd.DataFrame,
         variables: Mapping[str, Decimal],
+        state: RuleDslState | None = None,
     ) -> bool:
         if not isinstance(frame, pd.DataFrame) or frame.empty:
             return False
@@ -157,7 +267,8 @@ class RuleDslProgram:
         values = {name: _finite_number(value) for name, value in variables.items()}
         if set(values) != self._variables:
             raise ValueError("DSL_VARIABLE_SET_MISMATCH")
-        return _truth(_evaluate_node(self._root, frame, values))
+        checked_state = state or RuleDslState()
+        return _truth(_evaluate_node(self._root, frame, values, checked_state.values))
 
 
 def compile_rule(expression: str, variables: Sequence[str]) -> RuleDslProgram:
@@ -237,7 +348,7 @@ def _validate_node(node: ast.AST, variables: frozenset[str]) -> None:
             _validate_node(argument, variables)
         return
     if isinstance(node, ast.Name):
-        if node.id not in _FIELDS and node.id not in variables:
+        if node.id not in _FIELDS and node.id not in _STATE_FIELDS and node.id not in variables:
             raise ValueError("DSL_NAME_NOT_ALLOWED")
         return
     if isinstance(node, ast.Constant):
@@ -257,22 +368,27 @@ def _evaluate_node(
     node: ast.AST,
     frame: pd.DataFrame,
     variables: Mapping[str, float],
+    state: Mapping[str, bool | int | float],
 ) -> object:
     if isinstance(node, ast.Name):
-        return frame[node.id] if node.id in _FIELDS else variables[node.id]
+        if node.id in _FIELDS:
+            return frame[node.id]
+        if node.id in _STATE_FIELDS:
+            return state[node.id]
+        return variables[node.id]
     if isinstance(node, ast.Constant):
         return node.value
     if isinstance(node, ast.BoolOp):
-        values = [_truth(_evaluate_node(item, frame, variables)) for item in node.values]
+        values = [_truth(_evaluate_node(item, frame, variables, state)) for item in node.values]
         return all(values) if isinstance(node.op, ast.And) else any(values)
     if isinstance(node, ast.UnaryOp):
-        value = _evaluate_node(node.operand, frame, variables)
+        value = _evaluate_node(node.operand, frame, variables, state)
         if isinstance(node.op, ast.Not):
             return not _truth(value)
         return -value if isinstance(node.op, ast.USub) else value  # type: ignore[operator]
     if isinstance(node, ast.BinOp):
-        left = _evaluate_node(node.left, frame, variables)
-        right = _evaluate_node(node.right, frame, variables)
+        left = _evaluate_node(node.left, frame, variables, state)
+        right = _evaluate_node(node.right, frame, variables, state)
         if isinstance(node.op, ast.Add):
             return left + right  # type: ignore[operator]
         if isinstance(node.op, ast.Sub):
@@ -281,8 +397,8 @@ def _evaluate_node(
             return left * right  # type: ignore[operator]
         return left / right  # type: ignore[operator]
     if isinstance(node, ast.Compare):
-        left = _latest(_evaluate_node(node.left, frame, variables))
-        right = _latest(_evaluate_node(node.comparators[0], frame, variables))
+        left = _latest(_evaluate_node(node.left, frame, variables, state))
+        right = _latest(_evaluate_node(node.comparators[0], frame, variables, state))
         if not _both_finite(left, right):
             return False
         left_number = float(cast(int | float | Decimal, left))
@@ -301,7 +417,7 @@ def _evaluate_node(
         return left_number != right_number
     if isinstance(node, ast.Call):
         assert isinstance(node.func, ast.Name)
-        arguments = [_evaluate_node(item, frame, variables) for item in node.args]
+        arguments = [_evaluate_node(item, frame, variables, state) for item in node.args]
         return _call(node.func.id, arguments)
     raise ValueError("DSL_NODE_NOT_ALLOWED")
 
@@ -389,6 +505,58 @@ def _referenced_fields(node: ast.AST) -> set[str]:
     return {item.id for item in ast.walk(node) if isinstance(item, ast.Name) and item.id in _FIELDS}
 
 
+def rule_dsl_state(
+    frame: pd.DataFrame,
+    as_of: date,
+    holding: HoldingSummary | None,
+) -> RuleDslState:
+    if holding is None or holding.quantity <= 0:
+        return RuleDslState()
+    holding_days = 0
+    visible = frame
+    if holding.holding_since is not None:
+        visible = frame.loc[frame.index >= pd.Timestamp(holding.holding_since)]
+        holding_days = len(visible)
+    position_return = 0.0
+    if holding.average_cost > 0:
+        position_return = float(holding.mark_price / holding.average_cost - 1)
+    position_drawdown = 0.0
+    if not visible.empty:
+        peak = float(visible["close"].max())
+        if isfinite(peak) and peak > 0:
+            position_drawdown = min(0.0, float(holding.mark_price) / peak - 1)
+    return RuleDslState(True, holding_days, position_return, position_drawdown)
+
+
+def dsl_action_target(
+    rule: DslExecutableRule,
+    current_weight: Decimal,
+    maximum_weight: Decimal = Decimal("1"),
+) -> Decimal:
+    if (
+        type(current_weight) is not Decimal
+        or not current_weight.is_finite()
+        or not Decimal("0") <= current_weight <= Decimal("1")
+    ):
+        raise ValueError("DSL current weight must be between zero and one")
+    if (
+        type(maximum_weight) is not Decimal
+        or not maximum_weight.is_finite()
+        or not Decimal("0") < maximum_weight <= Decimal("1")
+    ):
+        raise ValueError("DSL maximum weight must be greater than zero and at most one")
+    if rule.action is DslAction.SELL_ALL:
+        return Decimal("0")
+    if rule.action is DslAction.HOLD:
+        return min(current_weight, maximum_weight)
+    assert rule.value is not None
+    if rule.action is DslAction.REDUCE_TO:
+        return min(current_weight, rule.value, maximum_weight)
+    if rule.action is DslAction.INCREASE_BY:
+        return min(current_weight + rule.value, maximum_weight)
+    return min(rule.value, maximum_weight)
+
+
 class RuleDslStrategy:
     strategy_type = "rule_dsl"
     parameters_type = RuleDslParameters
@@ -432,65 +600,106 @@ class RuleDslStrategy:
             ),
         )
         self.required_history = required_history(
-            (self.parameters.buy_expression, self.parameters.sell_expression),
+            tuple(item.expression for item in self.parameters.executable_rules),
             self.parameters.variable_values,
         )
         names = tuple(self.parameters.variable_values)
-        self._buy = compile_rule(self.parameters.buy_expression, names)
-        self._sell = compile_rule(self.parameters.sell_expression, names)
+        self._rules = tuple(
+            (rule, compile_rule(rule.expression, names))
+            for rule in self.parameters.executable_rules
+        )
         self.strategy_id = _normalize_strategy_id(strategy_id)
 
     def generate_targets(self, context: StrategyContext) -> StrategyDecision:
         prepared = _prepare_context(context, self.metadata.supported_asset_types)
         if isinstance(prepared, StrategyDecision):
             return prepared
-        states: list[tuple[InstrumentId, bool, str]] = []
+        states: list[tuple[InstrumentId, Decimal, str, Mapping[str, object]]] = []
         skipped = 0
         for instrument in prepared.instruments:
             history = prepared.histories[instrument]
             if len(history) < self.required_history:
                 skipped += 1
                 continue
-            buy = self._buy.evaluate(history, self.parameters.variable_values)
-            sell = self._sell.evaluate(history, self.parameters.variable_values)
             holding = context.holding(instrument)
-            held = holding is not None and holding.quantity > 0
-            active = False if sell else buy or held
-            reason = "DSL_SELL" if sell else "DSL_BUY" if buy else "DSL_HOLD"
-            states.append((instrument, active, reason))
+            state = rule_dsl_state(history, context.as_of, holding)
+            current_weight = (
+                Decimal("0")
+                if holding is None or context.account_equity <= 0
+                else min(Decimal("1"), holding.mark_price * holding.quantity / context.account_equity)
+            )
+            matched = tuple(
+                rule
+                for rule, program in self._rules
+                if program.evaluate(history, self.parameters.variable_values, state)
+            )
+            selected = matched[0] if matched else None
+            target = (
+                current_weight
+                if selected is None
+                else dsl_action_target(selected, current_weight, self.parameters.target_weight)
+            )
+            reason = (
+                "DSL_HOLD"
+                if selected is None or selected.action is DslAction.HOLD
+                else "DSL_SELL"
+                if selected.action in {DslAction.SELL_ALL, DslAction.REDUCE_TO}
+                else "DSL_BUY"
+            )
+            states.append(
+                (
+                    instrument,
+                    target,
+                    reason,
+                    {
+                        "instrument": str(instrument),
+                        "matched_rule_ids": tuple(item.rule_id for item in matched),
+                        "selected_rule_id": None if selected is None else selected.rule_id,
+                        "selected_action": None if selected is None else selected.action.value,
+                        "overridden_rule_ids": tuple(item.rule_id for item in matched[1:]),
+                        "current_weight": str(current_weight),
+                        "requested_weight": str(target),
+                    },
+                )
+            )
         if not states and skipped:
             return StrategyDecision.empty(
                 StrategyDecisionStatus.SKIPPED,
                 "INSUFFICIENT_HISTORY",
                 details={"required_history": self.required_history},
             )
-        active_count = sum(active for _, active, _ in states)
-        if active_count == 0 and not any(
-            context.holding(instrument) is not None for instrument, _, _ in states
+        requested_total = sum((target for _, target, _, _ in states), Decimal("0"))
+        if requested_total <= 0 and not any(
+            context.holding(instrument) is not None for instrument, _, _, _ in states
         ):
             return StrategyDecision.empty(
                 StrategyDecisionStatus.CASH,
                 "DSL_NO_SIGNAL_CASH",
                 details={"required_history": self.required_history},
             )
-        weights = iter(_equal_weights(active_count, self.parameters.target_weight))
+        scale = (
+            Decimal("1")
+            if requested_total <= self.parameters.target_weight
+            else self.parameters.target_weight / requested_total
+        )
         intents = tuple(
             TargetIntent(
                 strategy_id=self.strategy_id,
                 instrument=instrument,
-                target_weight=next(weights) if active else Decimal("0"),
-                score=1.0 if active else -1.0,
+                target_weight=target * scale,
+                score=1.0 if target > 0 else -1.0,
                 confidence=1.0,
                 reason_code=reason,
                 valid_until=context.as_of,
             )
-            for instrument, active, reason in states
+            for instrument, target, reason, _ in states
         )
         return StrategyDecision.generated(
             intents,
             details={
-                "active_count": active_count,
+                "active_count": sum(target > 0 for _, target, _, _ in states),
                 "required_history": self.required_history,
+                "rule_traces": tuple(trace for _, _, _, trace in states),
                 "variables": {
                     name: str(value) for name, value in self.parameters.variable_values.items()
                 },

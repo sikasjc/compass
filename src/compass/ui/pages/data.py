@@ -356,6 +356,24 @@ class MarketDataPreview:
         return f"{self.instrument_name}（{code}）"
 
 
+def instrument_display_label(
+    instrument: InstrumentId,
+    previews: Sequence[MarketDataPreview],
+) -> str:
+    """Resolve an instrument label from the latest stored market metadata."""
+    if type(instrument) is not InstrumentId:
+        raise TypeError("display instrument must be an exact InstrumentId")
+    for preview in previews:
+        if type(preview) is not MarketDataPreview:
+            raise TypeError("display previews must contain exact MarketDataPreview values")
+        if preview.instrument == instrument and preview.instrument_name is not None:
+            return preview.display_label
+    name = common_instrument_name(instrument)
+    if name is None:
+        return str(instrument)
+    return f"{name}（{instrument}）"
+
+
 @dataclass(frozen=True, slots=True)
 class DataSyncInstrumentFailure:
     instrument: InstrumentId
@@ -1440,9 +1458,7 @@ def render_data_page(model: DataPageModel | None) -> None:
                     if not missing_instruments:
                         missing_button.disable()
                 individual_options = {
-                    str(instrument): (
-                        f"{common_instrument_name(instrument) or '名称待同步'}（{instrument}）"
-                    )
+                    str(instrument): instrument_display_label(instrument, state.previews)
                     for instrument in state.watchlist_instruments
                 }
                 if selected_single_instrument not in individual_options:
@@ -1564,11 +1580,9 @@ def render_data_page(model: DataPageModel | None) -> None:
                             )
                             ui.label(detail).classes("text-xs text-red-700")
                         for failure in item.instrument_failures:
-                            instrument_name = (
-                                common_instrument_name(failure.instrument) or "名称待同步"
-                            )
                             ui.label(
-                                f"失败标的：{instrument_name}（{failure.instrument}） · "
+                                "失败标的："
+                                f"{instrument_display_label(failure.instrument, state.previews)} · "
                                 f"{failure.failure_code}"
                             ).classes("text-xs font-medium text-red-700")
                             for issue_code in failure.quality_issue_codes:

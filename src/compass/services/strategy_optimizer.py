@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from itertools import product
 import json
+from math import isfinite
 import os
 from pathlib import Path
+from statistics import median, pstdev
 from threading import RLock
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
@@ -17,6 +20,8 @@ from compass.domain.market import InstrumentId
 from compass.services.local_strategy_lab import LocalStrategyLabGateway
 from compass.services.safe_display import safe_display_text, safe_identifier
 from compass.storage.canonical_json import canonical_json, content_hash, decode_canonical_json
+from compass.strategies.kronos_forecast import KronosForecastParameters
+from compass.strategies.rule_dsl import RuleDslParameters
 from compass.ui.pages.strategy_lab import (
     StrategyLabConfiguration,
     StrategyLabKind,
@@ -34,9 +39,29 @@ if TYPE_CHECKING:
 
 Clock = Callable[[], datetime]
 IdFactory = Callable[[str], str]
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 3
+_READABLE_SCHEMA_VERSIONS = {1, 2, 3}
 _MAX_TRIALS = 50
+_VALIDATION_FOLDS = 3
 _PROGRESS_PHASES = {"preparing", "training", "validation", "frozen_test", "saving"}
+_DUAL_MA_PARAMETERS = frozenset({"short_window", "long_window", "confirmation_days"})
+_KRONOS_PARAMETERS = frozenset(
+    {
+        "entry_return",
+        "exit_return",
+        "minimum_path_positive_ratio",
+        "trend_window",
+        "rebalance_interval",
+        "horizon",
+    }
+)
+OptimizationValue = int | Decimal
+
+
+def _strategy_parameters_json(parameters: Mapping[str, object]) -> str:
+    from compass.ui.pages.strategies import strategy_parameters_json
+
+    return strategy_parameters_json(parameters)
 
 
 class StrategyOptimizationGateway(Protocol):
@@ -50,41 +75,99 @@ class StrategyOptimizationGateway(Protocol):
     ) -> StrategyInstance: ...
 
 
+def _checked_parameter_value(value: object) -> OptimizationValue:
+    if type(value) is int:
+        return value
+    if type(value) is Decimal and value.is_finite():
+        return value
+    raise TypeError("optimization values must be exact integers or finite Decimals")
+
+
+def _freeze_parameter_values(
+    values: Mapping[str, Sequence[OptimizationValue]],
+) -> Mapping[str, tuple[OptimizationValue, ...]]:
+    if not isinstance(values, Mapping) or not values:
+        raise ValueError("optimization parameter space must not be empty")
+    checked: dict[str, tuple[OptimizationValue, ...]] = {}
+    for name, candidates in values.items():
+        if type(name) is not str or not name or name != name.strip():
+            raise ValueError("optimization parameter names must be stable strings")
+        items = tuple(_checked_parameter_value(item) for item in candidates)
+        if not items or len(set(items)) != len(items):
+            raise ValueError("optimization parameter candidates must be non-empty and unique")
+        checked[name] = tuple(sorted(items))
+    return MappingProxyType(dict(sorted(checked.items())))
+
+
+def _freeze_trial_parameters(
+    values: Mapping[str, OptimizationValue],
+) -> Mapping[str, OptimizationValue]:
+    if not isinstance(values, Mapping) or not values:
+        raise ValueError("optimization trial parameters must not be empty")
+    checked = {
+        name: _checked_parameter_value(value)
+        for name, value in values.items()
+        if type(name) is str and name and name == name.strip()
+    }
+    if len(checked) != len(values):
+        raise ValueError("optimization trial parameter names are invalid")
+    return MappingProxyType(dict(sorted(checked.items())))
+
+
 @dataclass(frozen=True, slots=True)
 class OptimizationSearchSpace:
-    short_windows: tuple[int, ...]
-    long_windows: tuple[int, ...]
-    confirmation_days: tuple[int, ...]
+    parameter_values: Mapping[str, tuple[OptimizationValue, ...]]
 
     def __post_init__(self) -> None:
-        for name in ("short_windows", "long_windows", "confirmation_days"):
-            values = tuple(getattr(self, name))
-            if (
-                not values
-                or any(type(item) is not int or item <= 0 for item in values)
-                or values != tuple(sorted(set(values)))
-            ):
-                raise ValueError(f"{name} must contain unique sorted positive integers")
-            object.__setattr__(self, name, values)
+        frozen = _freeze_parameter_values(self.parameter_values)
+        object.__setattr__(self, "parameter_values", frozen)
         if self.trial_count > _MAX_TRIALS:
             raise ValueError("OPTIMIZATION_TRIAL_LIMIT_EXCEEDED")
-        if not any(
-            short < long
-            for short, long in product(self.short_windows, self.long_windows)
-        ):
-            raise ValueError("OPTIMIZATION_WINDOW_SPACE_INVALID")
+        if not self.candidates:
+            raise ValueError(
+                "OPTIMIZATION_WINDOW_SPACE_INVALID"
+                if set(frozen) == _DUAL_MA_PARAMETERS
+                else "OPTIMIZATION_PARAMETER_SPACE_INVALID"
+            )
+
+    @classmethod
+    def dual_ma(
+        cls,
+        short_windows: Sequence[int],
+        long_windows: Sequence[int],
+        confirmation_days: Sequence[int],
+    ) -> OptimizationSearchSpace:
+        for values in (short_windows, long_windows, confirmation_days):
+            if any(type(item) is not int or item <= 0 for item in values):
+                raise ValueError("dual-MA candidates must be positive integers")
+        return cls(
+            {
+                "short_window": tuple(short_windows),
+                "long_window": tuple(long_windows),
+                "confirmation_days": tuple(confirmation_days),
+            }
+        )
+
+    @property
+    def candidates(self) -> tuple[Mapping[str, OptimizationValue], ...]:
+        names = tuple(self.parameter_values)
+        candidates = []
+        for values in product(*(self.parameter_values[name] for name in names)):
+            item = dict(zip(names, values, strict=True))
+            short = item.get("short_window")
+            long = item.get("long_window")
+            if short is not None and long is not None and int(short) >= int(long):
+                continue
+            entry = item.get("entry_return")
+            exit_value = item.get("exit_return")
+            if entry is not None and exit_value is not None and Decimal(exit_value) >= Decimal(entry):
+                continue
+            candidates.append(MappingProxyType(item))
+        return tuple(candidates)
 
     @property
     def trial_count(self) -> int:
-        return sum(
-            1
-            for short, long, _ in product(
-                self.short_windows,
-                self.long_windows,
-                self.confirmation_days,
-            )
-            if short < long
-        )
+        return len(self.candidates)
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,25 +202,68 @@ class OptimizationMetrics:
 
 
 @dataclass(frozen=True, slots=True)
+class OptimizationValidationFold:
+    fold: int
+    start: date
+    end: date
+    metrics: OptimizationMetrics
+
+    def __post_init__(self) -> None:
+        if type(self.fold) is not int or self.fold <= 0:
+            raise ValueError("optimization fold must be a positive integer")
+        if type(self.start) is not date or type(self.end) is not date or self.start > self.end:
+            raise ValueError("optimization fold dates are invalid")
+        if type(self.metrics) is not OptimizationMetrics:
+            raise TypeError("optimization fold metrics must be exact")
+
+
+@dataclass(frozen=True, slots=True)
 class OptimizationTrial:
     rank: int
-    short_window: int
-    long_window: int
-    confirmation_days: int
+    parameters: Mapping[str, OptimizationValue]
     training: OptimizationMetrics
     validation: OptimizationMetrics
     frozen_test: OptimizationMetrics | None
     eligible: bool
     score: float
     rejection_reason: str | None = None
+    validation_folds: tuple[OptimizationValidationFold, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.rank) is not int or self.rank <= 0:
             raise ValueError("optimization trial rank must be positive")
-        if self.short_window >= self.long_window:
+        parameters = _freeze_trial_parameters(self.parameters)
+        object.__setattr__(self, "parameters", parameters)
+        if _DUAL_MA_PARAMETERS.issubset(parameters) and self.short_window >= self.long_window:
             raise ValueError("optimization trial windows are invalid")
         if type(self.eligible) is not bool or type(self.score) is not float:
             raise TypeError("optimization trial eligibility and score must be exact")
+        folds = tuple(self.validation_folds)
+        if folds and tuple(item.fold for item in folds) != tuple(range(1, len(folds) + 1)):
+            raise ValueError("optimization validation folds must be ordered without gaps")
+        object.__setattr__(self, "validation_folds", folds)
+
+    @property
+    def short_window(self) -> int:
+        return self._integer("short_window")
+
+    @property
+    def long_window(self) -> int:
+        return self._integer("long_window")
+
+    @property
+    def confirmation_days(self) -> int:
+        return self._integer("confirmation_days")
+
+    def _integer(self, name: str) -> int:
+        value = self.parameters.get(name)
+        if type(value) is not int:
+            raise AttributeError(name)
+        return value
+
+    @property
+    def parameter_text(self) -> str:
+        return " / ".join(f"{name}={value}" for name, value in self.parameters.items())
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +271,7 @@ class OptimizationExperiment:
     experiment_id: str
     source_instance_id: str
     source_name: str
+    strategy_type: str
     created_at: datetime
     start: date
     training_end: date
@@ -157,6 +284,7 @@ class OptimizationExperiment:
         safe_identifier(self.experiment_id, label="optimization experiment id")
         safe_identifier(self.source_instance_id, label="optimization source strategy")
         safe_display_text(self.source_name, label="optimization source name")
+        safe_identifier(self.strategy_type, label="optimization strategy type")
         if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
             raise ValueError("optimization creation time must be timezone-aware")
         if not self.start < self.training_end < self.validation_end < self.end:
@@ -175,9 +303,9 @@ class OptimizationProgress:
     phase: str
     current_trial: int
     trial_count: int
-    short_window: int | None = None
-    long_window: int | None = None
-    confirmation_days: int | None = None
+    parameters: Mapping[str, OptimizationValue] = field(default_factory=dict)
+    current_fold: int = 0
+    fold_count: int = _VALIDATION_FOLDS
 
     def __post_init__(self) -> None:
         safe_identifier(self.experiment_id, label="optimization progress experiment id")
@@ -191,13 +319,18 @@ class OptimizationProgress:
             or self.current_trial > self.trial_count
         ):
             raise ValueError("optimization progress current trial is invalid")
-        parameters = (
-            self.short_window,
-            self.long_window,
-            self.confirmation_days,
-        )
-        if any(value is not None and (type(value) is not int or value <= 0) for value in parameters):
-            raise ValueError("optimization progress parameters must be positive integers")
+        if self.parameters:
+            object.__setattr__(self, "parameters", _freeze_trial_parameters(self.parameters))
+        elif not isinstance(self.parameters, Mapping):
+            raise TypeError("optimization progress parameters must be a mapping")
+        if type(self.fold_count) is not int or self.fold_count <= 0:
+            raise ValueError("optimization progress fold count must be positive")
+        if type(self.current_fold) is not int or not 0 <= self.current_fold <= self.fold_count:
+            raise ValueError("optimization progress current fold is invalid")
+
+    @property
+    def parameter_text(self) -> str:
+        return " / ".join(f"{name}={value}" for name, value in self.parameters.items())
 
     @property
     def fraction(self) -> float:
@@ -206,12 +339,13 @@ class OptimizationProgress:
         if self.phase == "training":
             return max(0.0, (self.current_trial - 1) / self.trial_count)
         if self.phase == "validation":
-            return min(0.98, (self.current_trial - 0.5) / self.trial_count)
+            completed = self.current_trial - 1 + self.current_fold / self.fold_count
+            return min(0.98, completed / self.trial_count)
         return 0.99
 
 
 class LocalStrategyOptimizer:
-    """Run bounded dual-MA searches without polluting ordinary backtest history."""
+    """Run bounded, strategy-aware searches without polluting backtest history."""
 
     def __init__(
         self,
@@ -261,42 +395,44 @@ class LocalStrategyOptimizer:
 
     def run(self, experiment_id: str, request: OptimizationRequest) -> None:
         checked_id = safe_identifier(experiment_id, label="optimization experiment id")
-        trial_count = request.search_space.trial_count
-        self._set_progress(
-            OptimizationProgress(checked_id, "preparing", 0, trial_count)
-        )
         source = self._source(request.source_instance_id)
-        if source.strategy_type != StrategyLabKind.DUAL_MA.value:
+        if source.strategy_type not in {
+            StrategyLabKind.DUAL_MA.value,
+            StrategyLabKind.RULE_DSL.value,
+            StrategyLabKind.KRONOS_FORECAST.value,
+        }:
             raise ValueError("OPTIMIZATION_STRATEGY_UNSUPPORTED")
+        self._validate_search_space(source, request.search_space)
+        trial_count = request.search_space.trial_count
+        self._set_progress(OptimizationProgress(checked_id, "preparing", 0, trial_count))
         span = (request.end - request.start).days
-        training_end = request.start + timedelta(days=int(span * 0.60))
+        training_end = request.start + timedelta(days=int(span * 0.40))
         validation_end = request.start + timedelta(days=int(span * 0.80))
-        validation_start = training_end + timedelta(days=1)
+        fold_span = (validation_end - training_end).days
+        validation_ranges = tuple(
+            (
+                training_end
+                + timedelta(days=int(fold_span * position / _VALIDATION_FOLDS))
+                + timedelta(days=1),
+                validation_end
+                if position == _VALIDATION_FOLDS - 1
+                else training_end
+                + timedelta(days=int(fold_span * (position + 1) / _VALIDATION_FOLDS)),
+            )
+            for position in range(_VALIDATION_FOLDS)
+        )
         test_start = validation_end + timedelta(days=1)
         base = self._base_configuration(source, request.start, request.end)
         trials: list[OptimizationTrial] = []
-        for position, (short, long, confirmation) in enumerate(
-            (
-                values
-                for values in product(
-                    request.search_space.short_windows,
-                    request.search_space.long_windows,
-                    request.search_space.confirmation_days,
-                )
-                if values[0] < values[1]
-            ),
-            start=1,
-        ):
-            configured = self._with_parameters(base, short, long, confirmation)
+        for position, parameters in enumerate(request.search_space.candidates, start=1):
+            configured = self._with_parameters(base, source.strategy_type, parameters)
             self._set_progress(
                 OptimizationProgress(
                     checked_id,
                     "training",
                     position,
                     trial_count,
-                    short,
-                    long,
-                    confirmation,
+                    parameters,
                 )
             )
             training = self._metrics(
@@ -305,37 +441,39 @@ class LocalStrategyOptimizer:
                     replace(configured, start=request.start, end=training_end),
                 )
             )
-            self._set_progress(
-                OptimizationProgress(
+            validation_folds = tuple(
+                self._evaluate_validation_fold(
                     checked_id,
-                    "validation",
                     position,
                     trial_count,
-                    short,
-                    long,
-                    confirmation,
+                    parameters,
+                    configured,
+                    fold,
+                    fold_start,
+                    fold_end,
                 )
+                for fold, (fold_start, fold_end) in enumerate(validation_ranges, 1)
             )
-            validation = self._metrics(
-                self._backtests.evaluate(
-                    f"{checked_id}-trial-{position}-validate",
-                    replace(configured, start=validation_start, end=validation_end),
-                )
+            validation = self._aggregate_metrics(
+                tuple(item.metrics for item in validation_folds)
             )
-            eligible, reason = self._eligible(validation)
-            score = self._score(validation) if eligible else -1_000_000_000.0
+            eligible, reason = self._eligible(validation, validation_folds)
+            score = (
+                self._robust_score(validation_folds)
+                if eligible
+                else -1_000_000_000.0
+            )
             trials.append(
                 OptimizationTrial(
                     1,
-                    short,
-                    long,
-                    confirmation,
+                    parameters,
                     training,
                     validation,
                     None,
                     eligible,
                     score,
                     reason,
+                    validation_folds,
                 )
             )
         ordered = sorted(
@@ -365,21 +503,14 @@ class LocalStrategyOptimizer:
                     "frozen_test",
                     trial_count,
                     trial_count,
-                    best.short_window,
-                    best.long_window,
-                    best.confirmation_days,
+                    best.parameters,
                 )
             )
             test_metrics = self._metrics(
                 self._backtests.evaluate(
                     f"{checked_id}-frozen-test",
                     replace(
-                        self._with_parameters(
-                            base,
-                            best.short_window,
-                            best.long_window,
-                            best.confirmation_days,
-                        ),
+                        self._with_parameters(base, source.strategy_type, best.parameters),
                         start=test_start,
                         end=request.end,
                     ),
@@ -390,6 +521,7 @@ class LocalStrategyOptimizer:
             checked_id,
             source.instance_id,
             source.name,
+            source.strategy_type,
             self._timestamp(),
             request.start,
             training_end,
@@ -437,11 +569,7 @@ class LocalStrategyOptimizer:
             source = self._source(experiment.source_instance_id)
             pool = self._strategies.pool(source.watchlist_id)
             parameters = dict(source.parameters)
-            parameters.update(
-                short_window=trial.short_window,
-                long_window=trial.long_window,
-                confirmation_days=trial.confirmation_days,
-            )
+            parameters = self._published_parameters(source.strategy_type, parameters, trial)
             published = self._strategies.create_version(
                 source.instance_id,
                 StrategyDraft(
@@ -478,19 +606,43 @@ class LocalStrategyOptimizer:
             raise LookupError("OPTIMIZATION_MARKET_DATA_MISSING")
         signal = instruments[0]
         target_weight = Decimal(str(source.parameters.get("target_weight", "1")))
+        kind = StrategyLabKind(source.strategy_type)
+        leg_arguments: dict[str, object] = {}
+        if kind is StrategyLabKind.DUAL_MA:
+            leg_arguments.update(
+                short_window=self._integer_parameter(source, "short_window"),
+                long_window=self._integer_parameter(source, "long_window"),
+                confirmation_days=self._integer_parameter(source, "confirmation_days"),
+            )
+        elif kind is StrategyLabKind.RULE_DSL:
+            parameters = RuleDslParameters.model_validate_json(
+                _strategy_parameters_json(source.parameters), strict=True
+            )
+            leg_arguments.update(
+                buy_expression=parameters.buy_expression,
+                sell_expression=parameters.sell_expression,
+                variables=parameters.variables,
+                dsl_rules=parameters.rules,
+            )
+        elif kind is StrategyLabKind.KRONOS_FORECAST:
+            leg_arguments["kronos_parameters"] = KronosForecastParameters.model_validate_json(
+                _strategy_parameters_json(source.parameters), strict=True
+            )
         return StrategyLabConfiguration(
             strategies=(
                 StrategyLegConfiguration(
                     strategy_id=source.instance_id,
-                    strategy=StrategyLabKind.DUAL_MA,
+                    strategy=kind,
                     instruments=instruments,
                     budget=target_weight,
-                    signal_instrument=signal,
-                    short_window=self._integer_parameter(source, "short_window"),
-                    long_window=self._integer_parameter(source, "long_window"),
-                    confirmation_days=self._integer_parameter(source, "confirmation_days"),
+                    signal_instrument=(
+                        signal
+                        if kind in {StrategyLabKind.DUAL_MA, StrategyLabKind.RULE_DSL}
+                        else None
+                    ),
                     template_instance_id=source.instance_id,
                     template_name=source.name,
+                    **leg_arguments,  # type: ignore[arg-type]
                 ),
             ),
             benchmark=signal,
@@ -507,17 +659,127 @@ class LocalStrategyOptimizer:
     @staticmethod
     def _with_parameters(
         configuration: StrategyLabConfiguration,
-        short: int,
-        long: int,
-        confirmation: int,
+        strategy_type: str,
+        parameters: Mapping[str, OptimizationValue],
     ) -> StrategyLabConfiguration:
-        leg = replace(
-            configuration.strategies[0],
-            short_window=short,
-            long_window=long,
-            confirmation_days=confirmation,
-        )
+        leg = configuration.strategies[0]
+        if strategy_type == StrategyLabKind.DUAL_MA.value:
+            leg = replace(
+                leg,
+                short_window=int(parameters["short_window"]),
+                long_window=int(parameters["long_window"]),
+                confirmation_days=int(parameters["confirmation_days"]),
+            )
+        elif strategy_type == StrategyLabKind.RULE_DSL.value:
+            updated_variables = tuple(
+                variable.model_copy(
+                    update={"value": Decimal(parameters.get(f"variable.{variable.name}", variable.value))}
+                )
+                for variable in leg.variables
+            )
+            leg = replace(leg, variables=updated_variables)
+        elif strategy_type == StrategyLabKind.KRONOS_FORECAST.value:
+            if leg.kronos_parameters is None:
+                raise ValueError("OPTIMIZATION_KRONOS_PARAMETERS_MISSING")
+            payload = leg.kronos_parameters.model_dump()
+            payload.update(parameters)
+            leg = replace(
+                leg,
+                kronos_parameters=KronosForecastParameters.model_validate(payload, strict=True),
+            )
+        else:
+            raise ValueError("OPTIMIZATION_STRATEGY_UNSUPPORTED")
         return replace(configuration, strategies=(leg,))
+
+    @staticmethod
+    def _validate_search_space(
+        source: StrategyInstance,
+        search_space: OptimizationSearchSpace,
+    ) -> None:
+        names = set(search_space.parameter_values)
+        if source.strategy_type == StrategyLabKind.DUAL_MA.value:
+            if names != _DUAL_MA_PARAMETERS:
+                raise ValueError("OPTIMIZATION_DUAL_MA_SPACE_INVALID")
+            if any(
+                type(value) is not int or value <= 0
+                for values in search_space.parameter_values.values()
+                for value in values
+            ):
+                raise ValueError("OPTIMIZATION_DUAL_MA_SPACE_INVALID")
+            return
+        if source.strategy_type == StrategyLabKind.RULE_DSL.value:
+            parsed_rule = RuleDslParameters.model_validate_json(
+                _strategy_parameters_json(source.parameters), strict=True
+            )
+            variables = {
+                f"variable.{item.name}": item
+                for item in parsed_rule.optimization_variables
+            }
+            if not names or not names.issubset(variables):
+                raise ValueError("OPTIMIZATION_DSL_SPACE_INVALID")
+            for name, values in search_space.parameter_values.items():
+                variable = variables[name]
+                for raw in values:
+                    value = Decimal(raw)
+                    if (
+                        value < variable.minimum
+                        or value > variable.maximum
+                    ):
+                        raise ValueError("OPTIMIZATION_DSL_SPACE_INVALID")
+            return
+        if source.strategy_type == StrategyLabKind.KRONOS_FORECAST.value:
+            if not names or not names.issubset(_KRONOS_PARAMETERS):
+                raise ValueError("OPTIMIZATION_KRONOS_SPACE_INVALID")
+            parsed_kronos = KronosForecastParameters.model_validate_json(
+                _strategy_parameters_json(source.parameters), strict=True
+            )
+            for candidate in search_space.candidates:
+                payload = parsed_kronos.model_dump()
+                payload.update(candidate)
+                try:
+                    KronosForecastParameters.model_validate(payload, strict=True)
+                except ValueError:
+                    raise ValueError("OPTIMIZATION_KRONOS_SPACE_INVALID") from None
+            return
+        raise ValueError("OPTIMIZATION_STRATEGY_UNSUPPORTED")
+
+    @staticmethod
+    def _published_parameters(
+        strategy_type: str,
+        source_parameters: Mapping[str, object],
+        trial: OptimizationTrial,
+    ) -> dict[str, object]:
+        if strategy_type == StrategyLabKind.DUAL_MA.value:
+            result = dict(source_parameters)
+            result.update(trial.parameters)
+            return result
+        if strategy_type == StrategyLabKind.RULE_DSL.value:
+            parsed_rule = RuleDslParameters.model_validate_json(
+                _strategy_parameters_json(source_parameters), strict=True
+            )
+            variables = tuple(
+                variable.model_copy(
+                    update={
+                        "value": Decimal(
+                            trial.parameters.get(
+                                f"variable.{variable.name}", variable.value
+                            )
+                        )
+                    }
+                )
+                for variable in parsed_rule.variables
+            )
+            updated_rule = parsed_rule.model_copy(update={"variables": variables})
+            return dict(updated_rule.model_dump(mode="json"))
+        if strategy_type == StrategyLabKind.KRONOS_FORECAST.value:
+            parsed_kronos = KronosForecastParameters.model_validate_json(
+                _strategy_parameters_json(source_parameters), strict=True
+            )
+            payload = parsed_kronos.model_dump()
+            payload.update(trial.parameters)
+            updated_kronos = KronosForecastParameters.model_validate(payload, strict=True)
+            return dict(updated_kronos.model_dump(mode="json"))
+        raise ValueError("OPTIMIZATION_STRATEGY_UNSUPPORTED")
 
     @staticmethod
     def _integer_parameter(source: StrategyInstance, name: str) -> int:
@@ -539,8 +801,73 @@ class LocalStrategyOptimizer:
             len(result.fills),
         )
 
+    def _evaluate_validation_fold(
+        self,
+        experiment_id: str,
+        trial: int,
+        trial_count: int,
+        parameters: Mapping[str, OptimizationValue],
+        configured: StrategyLabConfiguration,
+        fold: int,
+        start: date,
+        end: date,
+    ) -> OptimizationValidationFold:
+        self._set_progress(
+            OptimizationProgress(
+                experiment_id,
+                "validation",
+                trial,
+                trial_count,
+                parameters,
+                current_fold=fold,
+            )
+        )
+        metrics = self._metrics(
+            self._backtests.evaluate(
+                f"{experiment_id}-trial-{trial}-validate-{fold}",
+                replace(configured, start=start, end=end),
+            )
+        )
+        return OptimizationValidationFold(fold, start, end, metrics)
+
     @staticmethod
-    def _eligible(metrics: OptimizationMetrics) -> tuple[bool, str | None]:
+    def _median(values: Sequence[float | None]) -> float | None:
+        usable = tuple(value for value in values if value is not None and isfinite(value))
+        return None if not usable else float(median(usable))
+
+    @classmethod
+    def _aggregate_metrics(
+        cls,
+        folds: Sequence[OptimizationMetrics],
+    ) -> OptimizationMetrics:
+        if not folds:
+            raise ValueError("optimization validation folds must not be empty")
+        drawdowns = tuple(
+            item.maximum_drawdown
+            for item in folds
+            if item.maximum_drawdown is not None and isfinite(item.maximum_drawdown)
+        )
+        return OptimizationMetrics(
+            cls._median(tuple(item.total_return for item in folds)),
+            cls._median(tuple(item.calmar_ratio for item in folds)),
+            cls._median(tuple(item.sharpe_ratio for item in folds)),
+            None if not drawdowns else min(drawdowns),
+            cls._median(tuple(item.total_turnover for item in folds)),
+            sum(item.trade_count for item in folds),
+        )
+
+    @staticmethod
+    def _eligible(
+        metrics: OptimizationMetrics,
+        folds: Sequence[OptimizationValidationFold] = (),
+    ) -> tuple[bool, str | None]:
+        if folds:
+            evaluable = sum(
+                item.metrics.trade_count > 0 and item.metrics.total_return is not None
+                for item in folds
+            )
+            if evaluable < 2:
+                return False, "至少需要两个有成交的滚动验证窗口"
         if metrics.trade_count == 0:
             return False, "验证区间没有成交"
         if metrics.total_return is None:
@@ -550,14 +877,22 @@ class LocalStrategyOptimizer:
         return True, None
 
     @staticmethod
-    def _score(metrics: OptimizationMetrics) -> float:
-        return (
-            metrics.calmar_ratio
-            if metrics.calmar_ratio is not None
-            else metrics.total_return
-            if metrics.total_return is not None
-            else -1_000_000_000.0
+    def _robust_score(folds: Sequence[OptimizationValidationFold]) -> float:
+        calmars = tuple(
+            item.metrics.calmar_ratio
+            for item in folds
+            if item.metrics.calmar_ratio is not None and isfinite(item.metrics.calmar_ratio)
         )
+        values = calmars
+        if len(values) < 2:
+            values = tuple(
+                item.metrics.total_return
+                for item in folds
+                if item.metrics.total_return is not None and isfinite(item.metrics.total_return)
+            )
+        if not values:
+            return -1_000_000_000.0
+        return float(median(values) - (pstdev(values) if len(values) > 1 else 0.0))
 
     def _timestamp(self) -> datetime:
         value = self._clock()
@@ -569,13 +904,14 @@ class LocalStrategyOptimizer:
         try:
             wrapper = json.loads(self._path.read_text("utf-8"))
             payload = decode_canonical_json(wrapper["payload_json"], wrapper["content_hash"])
-            if payload.get("schema_version") != _SCHEMA_VERSION:
+            schema_version = payload.get("schema_version")
+            if type(schema_version) is not int or schema_version not in _READABLE_SCHEMA_VERSIONS:
                 raise ValueError
             raw_experiments = payload["experiments"]
             if not isinstance(raw_experiments, list):
                 raise ValueError
             return tuple(
-                self._decode(item)
+                self._decode(item, schema_version)
                 for item in raw_experiments
                 if isinstance(item, Mapping)
             )
@@ -618,26 +954,40 @@ class LocalStrategyOptimizer:
             "end": value.end.isoformat(),
             "experiment_id": value.experiment_id,
             "published_instance_id": value.published_instance_id,
+            "strategy_type": value.strategy_type,
             "source_instance_id": value.source_instance_id,
             "source_name": value.source_name,
             "start": value.start.isoformat(),
             "training_end": value.training_end.isoformat(),
             "trials": [
                 {
-                    "confirmation_days": item.confirmation_days,
                     "eligible": item.eligible,
                     "frozen_test": (
                         None
                         if item.frozen_test is None
                         else cls._metric_payload(item.frozen_test)
                     ),
-                    "long_window": item.long_window,
+                    "parameters": {
+                        name: {
+                            "type": "integer" if type(parameter) is int else "decimal",
+                            "value": parameter if type(parameter) is int else str(parameter),
+                        }
+                        for name, parameter in item.parameters.items()
+                    },
                     "rank": item.rank,
                     "rejection_reason": item.rejection_reason,
                     "score": item.score,
-                    "short_window": item.short_window,
                     "training": cls._metric_payload(item.training),
                     "validation": cls._metric_payload(item.validation),
+                    "validation_folds": [
+                        {
+                            "end": fold.end.isoformat(),
+                            "fold": fold.fold,
+                            "metrics": cls._metric_payload(fold.metrics),
+                            "start": fold.start.isoformat(),
+                        }
+                        for fold in item.validation_folds
+                    ],
                 }
                 for item in value.trials
             ],
@@ -656,7 +1006,11 @@ class LocalStrategyOptimizer:
         )
 
     @classmethod
-    def _decode(cls, value: Mapping[str, object]) -> OptimizationExperiment:
+    def _decode(
+        cls,
+        value: Mapping[str, object],
+        schema_version: int,
+    ) -> OptimizationExperiment:
         raw_trials = value["trials"]
         if not isinstance(raw_trials, list):
             raise ValueError
@@ -665,29 +1019,74 @@ class LocalStrategyOptimizer:
             if not isinstance(raw, Mapping):
                 raise ValueError
             frozen = raw["frozen_test"]
+            if schema_version == 1:
+                parameters: Mapping[str, OptimizationValue] = {
+                    "short_window": raw["short_window"],
+                    "long_window": raw["long_window"],
+                    "confirmation_days": raw["confirmation_days"],
+                }
+            else:
+                raw_parameters = raw["parameters"]
+                if not isinstance(raw_parameters, Mapping):
+                    raise ValueError
+                decoded_parameters: dict[str, OptimizationValue] = {}
+                for name, encoded in raw_parameters.items():
+                    if type(name) is not str or not isinstance(encoded, Mapping):
+                        raise ValueError
+                    kind = encoded.get("type")
+                    parameter = encoded.get("value")
+                    if kind == "integer" and type(parameter) is int:
+                        decoded_parameters[name] = parameter
+                    elif kind == "decimal" and type(parameter) is str:
+                        parsed = Decimal(parameter)
+                        if not parsed.is_finite() or str(parsed) != parameter:
+                            raise ValueError
+                        decoded_parameters[name] = parsed
+                    else:
+                        raise ValueError
+                parameters = decoded_parameters
+            raw_folds = raw.get("validation_folds", []) if schema_version >= 3 else []
+            if not isinstance(raw_folds, list):
+                raise ValueError
+            validation_folds = tuple(
+                OptimizationValidationFold(
+                    fold=item["fold"],
+                    start=date.fromisoformat(item["start"]),
+                    end=date.fromisoformat(item["end"]),
+                    metrics=cls._decode_metrics(item["metrics"]),
+                )
+                for item in raw_folds
+                if isinstance(item, Mapping)
+            )
+            if len(validation_folds) != len(raw_folds):
+                raise ValueError
             trials.append(
                 OptimizationTrial(
                     raw["rank"],
-                    raw["short_window"],
-                    raw["long_window"],
-                    raw["confirmation_days"],
+                    parameters,
                     cls._decode_metrics(raw["training"]),
                     cls._decode_metrics(raw["validation"]),
                     None if frozen is None else cls._decode_metrics(frozen),
                     raw["eligible"],
                     raw["score"],
                     raw["rejection_reason"],
+                    validation_folds,
                 )
             )
         return OptimizationExperiment(
-            value["experiment_id"],  # type: ignore[arg-type]
-            value["source_instance_id"],  # type: ignore[arg-type]
-            value["source_name"],  # type: ignore[arg-type]
-            datetime.fromisoformat(value["created_at"]),  # type: ignore[arg-type]
-            date.fromisoformat(value["start"]),  # type: ignore[arg-type]
-            date.fromisoformat(value["training_end"]),  # type: ignore[arg-type]
-            date.fromisoformat(value["validation_end"]),  # type: ignore[arg-type]
-            date.fromisoformat(value["end"]),  # type: ignore[arg-type]
-            tuple(trials),
-            value["published_instance_id"],  # type: ignore[arg-type]
+            experiment_id=value["experiment_id"],  # type: ignore[arg-type]
+            source_instance_id=value["source_instance_id"],  # type: ignore[arg-type]
+            source_name=value["source_name"],  # type: ignore[arg-type]
+            strategy_type=(
+                StrategyLabKind.DUAL_MA.value
+                if schema_version == 1
+                else value["strategy_type"]  # type: ignore[arg-type]
+            ),
+            created_at=datetime.fromisoformat(value["created_at"]),  # type: ignore[arg-type]
+            start=date.fromisoformat(value["start"]),  # type: ignore[arg-type]
+            training_end=date.fromisoformat(value["training_end"]),  # type: ignore[arg-type]
+            validation_end=date.fromisoformat(value["validation_end"]),  # type: ignore[arg-type]
+            end=date.fromisoformat(value["end"]),  # type: ignore[arg-type]
+            trials=tuple(trials),
+            published_instance_id=value["published_instance_id"],  # type: ignore[arg-type]
         )

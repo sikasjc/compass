@@ -5,6 +5,7 @@ from decimal import Decimal
 import pandas as pd
 import pytest
 
+from compass.strategies.rule_dsl import DslAction
 from compass.strategies.rule_document import (
     RuleExecution,
     RuleSide,
@@ -55,8 +56,9 @@ def test_rule_document_canonical_payload_round_trips_and_hashes() -> None:
     compiled = migrated.compile_parameters()
     assert compiled.variables == original.variables
     assert compiled.target_weight == original.target_weight
-    assert compiled.buy_expression == f"({original.buy_expression})"
-    assert compiled.sell_expression == f"({original.sell_expression})"
+    assert compiled.buy_expression == original.buy_expression
+    assert compiled.sell_expression == original.sell_expression
+    assert compiled.rules == original.rules
 
 
 def test_rule_document_preserves_execution_timing_when_compiled_and_migrated() -> None:
@@ -71,26 +73,27 @@ def test_rule_document_preserves_execution_timing_when_compiled_and_migrated() -
     assert migrated.execute is RuleExecution.NEXT_CLOSE
 
 
-def test_rule_document_rejects_incompatible_buy_targets_and_arbitrary_python() -> None:
+def test_rule_document_supports_distinct_position_actions_and_rejects_arbitrary_python() -> None:
     base = default_rule_document()
-    with pytest.raises(ValueError, match="shared buy target"):
-        StrategyRuleDocument.model_validate(
-            base.model_copy(
-                update={
-                    "rules": (
-                        *base.rules,
-                        StrategyRule(
-                            rule_id="small_entry",
-                            name="小仓买入",
-                            side=RuleSide.BUY,
-                            priority=80,
-                            expression="close > open",
-                            target_weight=Decimal("0.5"),
-                        ),
-                    )
-                }
-            )
+    document = StrategyRuleDocument.model_validate(
+        base.model_copy(
+            update={
+                "rules": (
+                    *base.rules,
+                    StrategyRule(
+                        rule_id="small_entry",
+                        name="小仓买入",
+                        side=RuleSide.BUY,
+                        priority=80,
+                        expression="close > open",
+                        action=DslAction.INCREASE_BY,
+                        target_weight=Decimal("0.25"),
+                    ),
+                )
+            }
         )
+    )
+    assert document.compile_parameters().rules[-1].action is DslAction.INCREASE_BY
     with pytest.raises(ValueError, match="DSL_FUNCTION_NOT_ALLOWED"):
         StrategyRuleDocument.model_validate(
             base.model_copy(

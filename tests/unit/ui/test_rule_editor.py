@@ -12,7 +12,7 @@ from compass.storage.strategy_draft_repository import StrategyDraftRepository
 from compass.strategies.base import StrategyFrequency
 from compass.strategies.registry import StrategyRegistry
 from compass.strategies.rule_document import RuleSide, default_rule_document
-from compass.strategies.rule_dsl import RuleDslStrategy
+from compass.strategies.rule_dsl import DslAction, RuleDslStrategy
 from compass.ui.pages.strategies import (
     StrategyInstance,
     StrategyPageModel,
@@ -106,6 +106,7 @@ def test_rule_editor_draft_preview_and_publish_flow(tmp_path: Path) -> None:
 
     assert preview.signals
     assert preview.signals[0].side is RuleSide.BUY
+    assert preview.signals[0].action is DslAction.TARGET_WEIGHT
     assert preview.signals[0].target_weight == Decimal("1")
     published = page.publish_rule_draft(draft.draft_id)
     assert published.version == 1

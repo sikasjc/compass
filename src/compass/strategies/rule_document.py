@@ -16,6 +16,8 @@ from compass.storage.canonical_json import canonical_json, content_hash
 from compass.services.safe_display import safe_identifier
 from compass.strategies.base import StrategyParameters
 from compass.strategies.rule_dsl import (
+    DslAction,
+    DslExecutableRule,
     DslVariable,
     RuleDslParameters,
     RuleDslProgram,
@@ -43,6 +45,7 @@ class StrategyRule(StrategyParameters):
     side: RuleSide
     priority: int = Field(strict=True, ge=1, le=10_000)
     expression: str = Field(min_length=1, max_length=2_048)
+    action: DslAction | None = None
     target_weight: Decimal | None = Field(
         default=None,
         strict=True,
@@ -68,17 +71,40 @@ class StrategyRule(StrategyParameters):
 
     @model_validator(mode="after")
     def validate_action(self) -> StrategyRule:
-        if self.side is RuleSide.BUY and self.target_weight is None:
-            raise ValueError("buy rule requires target weight")
-        if self.side is RuleSide.SELL and self.target_weight is not None:
-            raise ValueError("sell rule cannot define target weight")
+        action = self.action
+        if action is None:
+            action = (
+                DslAction.TARGET_WEIGHT
+                if self.side is RuleSide.BUY
+                else DslAction.SELL_ALL
+            )
+            object.__setattr__(self, "action", action)
+        allowed = (
+            {DslAction.TARGET_WEIGHT, DslAction.INCREASE_BY, DslAction.HOLD}
+            if self.side is RuleSide.BUY
+            else {DslAction.REDUCE_TO, DslAction.SELL_ALL, DslAction.HOLD}
+        )
+        if action not in allowed:
+            raise ValueError("rule action does not match rule side")
+        needs_value = action in {
+            DslAction.TARGET_WEIGHT,
+            DslAction.REDUCE_TO,
+            DslAction.INCREASE_BY,
+        }
+        if needs_value != (self.target_weight is not None):
+            raise ValueError("rule target weight does not match action")
         return self
+
+    @property
+    def resolved_action(self) -> DslAction:
+        assert self.action is not None
+        return self.action
 
 
 class StrategyRuleDocument(StrategyParameters):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: int = Field(default=1, strict=True)
+    schema_version: int = Field(default=2, strict=True)
     name: str = Field(min_length=1, max_length=80)
     description: str = Field(default="", max_length=500)
     variables: tuple[DslVariable, ...] = Field(default=(), max_length=32)
@@ -104,7 +130,7 @@ class StrategyRuleDocument(StrategyParameters):
 
     @model_validator(mode="after")
     def validate_document(self) -> StrategyRuleDocument:
-        if self.schema_version != 1:
+        if self.schema_version not in {1, 2}:
             raise ValueError("unsupported strategy rule document version")
         variable_names = tuple(variable.name for variable in self.variables)
         if len(set(variable_names)) != len(variable_names):
@@ -116,9 +142,6 @@ class StrategyRuleDocument(StrategyParameters):
             raise ValueError("strategy document requires a buy rule")
         if not any(rule.side is RuleSide.SELL for rule in self.rules):
             raise ValueError("strategy document requires a sell rule")
-        targets = {rule.target_weight for rule in self.rules if rule.side is RuleSide.BUY}
-        if len(targets) != 1:
-            raise ValueError("first version requires one shared buy target weight")
         for rule in self.rules:
             compile_rule(rule.expression, variable_names)
         required_history(self.expressions, self.variable_values)
@@ -134,9 +157,7 @@ class StrategyRuleDocument(StrategyParameters):
 
     @property
     def target_weight(self) -> Decimal:
-        value = next(rule.target_weight for rule in self.rules if rule.side is RuleSide.BUY)
-        assert value is not None
-        return value
+        return Decimal("1")
 
     @property
     def minimum_history(self) -> int:
@@ -162,6 +183,7 @@ class StrategyRuleDocument(StrategyParameters):
             "name": self.name,
             "rules": [
                 {
+                    "action": rule.resolved_action.value,
                     "expression": rule.expression,
                     "name": rule.name,
                     "priority": rule.priority,
@@ -195,6 +217,17 @@ class StrategyRuleDocument(StrategyParameters):
             variables=self.variables,
             target_weight=self.target_weight,
             execution=self.execute.value,
+            rules=tuple(
+                DslExecutableRule(
+                    rule_id=rule.rule_id,
+                    name=rule.name,
+                    priority=rule.priority,
+                    expression=rule.expression,
+                    action=rule.resolved_action,
+                    value=rule.target_weight,
+                )
+                for rule in self.rules
+            ),
         )
 
     def compiled_rules(self) -> tuple[tuple[StrategyRule, RuleDslProgram], ...]:
@@ -266,6 +299,30 @@ def document_from_parameters(
     name: str,
     parameters: RuleDslParameters,
 ) -> StrategyRuleDocument:
+    if parameters.rules:
+        return StrategyRuleDocument(
+            name=name,
+            description="由已发布的分级仓位规则创建。",
+            variables=parameters.variables,
+            execute=RuleExecution(parameters.execution),
+            rules=tuple(
+                StrategyRule(
+                    rule_id=rule.rule_id,
+                    name=rule.name,
+                    side=(
+                        RuleSide.BUY
+                        if rule.action
+                        in {DslAction.TARGET_WEIGHT, DslAction.INCREASE_BY, DslAction.HOLD}
+                        else RuleSide.SELL
+                    ),
+                    priority=rule.priority,
+                    expression=rule.expression,
+                    action=rule.action,
+                    target_weight=rule.value,
+                )
+                for rule in parameters.rules
+            ),
+        )
     return StrategyRuleDocument(
         name=name,
         description="由原有买入/卖出表达式迁移。",
@@ -316,6 +373,11 @@ def document_from_payload(payload: Mapping[str, object]) -> StrategyRuleDocument
                 side=RuleSide(str(item["side"])),
                 priority=item["priority"],
                 expression=str(item["expression"]),
+                action=(
+                    None
+                    if item.get("action") is None
+                    else DslAction(str(item["action"]))
+                ),
                 target_weight=(
                     None if item["target_weight"] is None else Decimal(str(item["target_weight"]))
                 ),

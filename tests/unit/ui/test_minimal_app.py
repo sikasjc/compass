@@ -11,6 +11,7 @@ from compass.ui.pages.data import (
     DataSyncHistoryEntry,
     DataSyncRange,
     MarketDataPreview,
+    instrument_display_label,
     sync_coverage_notice,
 )
 from compass.ui.pages.watchlists import (
@@ -135,6 +136,30 @@ def test_sync_history_can_confirm_download_and_reuse_counts() -> None:
     assert entry.downloaded_rows == 10
     assert entry.reused_rows == 900
     assert entry.remaining_requested_sessions == 0
+
+
+def test_instrument_label_uses_latest_synced_market_metadata() -> None:
+    instrument = InstrumentId.parse("SZSE.159326")
+    bar = MarketBarPoint("2026-08-11", 1.0, 1.1, 0.9, 1.05, 1000.0)
+    preview = MarketDataPreview(
+        instrument,
+        "tencent",
+        "manifest-159326",
+        1,
+        "2026-08-11",
+        "2026-08-11",
+        (bar,),
+        True,
+        0,
+        instrument_name="创业板成长ETF",
+    )
+
+    assert instrument_display_label(instrument, (preview,)) == (
+        "创业板成长ETF（SZSE.159326）"
+    )
+    assert instrument_display_label(InstrumentId.parse("SZSE.159999"), (preview,)) == (
+        "SZSE.159999"
+    )
 
 
 def test_sync_coverage_notice_separates_pre_listing_history_from_real_gaps() -> None:

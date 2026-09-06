@@ -893,6 +893,51 @@ def test_signal_center_isolates_accounts_settings_snapshots_and_decisions(
         application.shutdown()
 
 
+def test_account_valuation_history_extends_when_market_data_is_incremented(
+    tmp_path: Path,
+) -> None:
+    sequence = count(1)
+    valuation_now = datetime(2026, 8, 12, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+    application = build_local_application(
+        Settings.from_env(tmp_path),
+        providers=(BacktestProvider(),),
+        clock=lambda: valuation_now,
+        id_factory=lambda kind: f"{kind}-{next(sequence)}",
+        expected_sessions=lambda request: pd.bdate_range(
+            request.start, request.end, name="date"
+        ),
+        sync_window=lambda today: (date(2026, 8, 3), date(2026, 8, 7)),
+    )
+    application.watchlists.save_primary(WatchlistDraft("关注标的", (FIRST,)))
+    try:
+        application.data_gateway.sync(
+            "akshare", date(2026, 8, 3), date(2026, 8, 7)
+        )
+        account = application.signal_center.save_account(
+            "10000.00",
+            (AccountPositionInput(str(FIRST), 100, 100, "4.00"),),
+        )
+
+        initial = application.signal_center.account_valuation_history()
+        assert initial[-1].day == date(2026, 8, 7)
+        assert initial[-1].equity == Decimal("10404.00")
+
+        application.data_gateway.sync(
+            "akshare", date(2026, 8, 10), date(2026, 8, 11)
+        )
+        updated = application.signal_center.account_valuation_history()
+
+        assert tuple(item.day for item in updated[-3:]) == (
+            date(2026, 8, 7),
+            date(2026, 8, 10),
+            date(2026, 8, 11),
+        )
+        assert updated[-1].equity == Decimal("10401.00")
+        assert updated[-1].source_snapshot_row_id == account.row_id
+    finally:
+        application.shutdown()
+
+
 def test_signal_decision_comparison_and_cleanup_use_the_frozen_account(
     tmp_path: Path,
 ) -> None:

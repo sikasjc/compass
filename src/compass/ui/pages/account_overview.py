@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -8,9 +8,17 @@ from typing import Protocol
 
 from nicegui import ui
 
+from compass.domain.market import InstrumentId
+from compass.domain.trading import AccountSnapshot, Position
 from compass.services.export_service import DecisionExportRecord
+from compass.services.instrument_classification import (
+    InstrumentCategory,
+    InstrumentClassification,
+    classify_instrument,
+)
 from compass.services.local_signal_center import (
     AccountPositionInput,
+    SignalAccountValuationPoint,
     SignalDecisionFreshness,
     SignalInstrumentChoice,
 )
@@ -23,6 +31,16 @@ from compass.storage.signal_execution_repository import (
 
 
 Today = Callable[[], date]
+_CATEGORY_COLORS = {
+    InstrumentCategory.BROAD: "#2563eb",
+    InstrumentCategory.INDUSTRY: "#ea580c",
+    InstrumentCategory.DIVIDEND: "#dc2626",
+    InstrumentCategory.GROWTH: "#7c3aed",
+    InstrumentCategory.BOND: "#059669",
+    InstrumentCategory.COMMODITY: "#ca8a04",
+    InstrumentCategory.OVERSEAS: "#0891b2",
+    InstrumentCategory.OTHER: "#64748b",
+}
 
 
 class AccountOverviewGateway(Protocol):
@@ -36,6 +54,7 @@ class AccountOverviewGateway(Protocol):
     def instruments(self) -> tuple[SignalInstrumentChoice, ...]: ...
     def latest_account(self) -> StoredAccountSnapshot | None: ...
     def account_history(self) -> tuple[StoredAccountSnapshot, ...]: ...
+    def account_valuation_history(self) -> tuple[SignalAccountValuationPoint, ...]: ...
     def compact_account_history(self) -> int: ...
     def save_account(
         self, cash: object, positions: Sequence[AccountPositionInput]
@@ -65,6 +84,7 @@ class AccountOverviewState:
     instruments: tuple[SignalInstrumentChoice, ...]
     latest: StoredAccountSnapshot | None
     history: tuple[StoredAccountSnapshot, ...]
+    valuations: tuple[SignalAccountValuationPoint, ...]
     decisions: tuple[AccountDecisionAudit, ...]
 
 
@@ -176,62 +196,102 @@ class AccountOverviewPageModel:
             tuple(instruments),
             self._gateway.latest_account(),
             tuple(self._gateway.account_history()),
+            tuple(self._gateway.account_valuation_history()),
             tuple(audits),
         )
 
 
 def _fund_chart_options(
+    valuations: Sequence[SignalAccountValuationPoint],
     history: Sequence[StoredAccountSnapshot],
     decisions: Sequence[AccountDecisionAudit],
+    classifications: Mapping[InstrumentId, InstrumentClassification],
 ) -> dict[str, object]:
-    records = tuple(history)
-    categories = [
-        f"{item.captured_at.strftime('%m-%d %H:%M')} · #{item.row_id}" for item in records
-    ]
-    category_by_row = {item.row_id: category for item, category in zip(records, categories)}
-    equity_by_row = {item.row_id: float(item.snapshot.equity) for item in records}
+    points = tuple(valuations)
+    categories = [item.day.isoformat() for item in points]
+    category_by_day = {item.day: category for item, category in zip(points, categories)}
+    equity_by_day = {item.day: float(item.equity) for item in points}
+    snapshot_day_by_row = {item.row_id: item.snapshot.as_of for item in history}
     buy_points = []
     sell_points = []
     for item in decisions:
         row_id = item.resulting_snapshot_row_id
-        if row_id is None or row_id not in category_by_row:
+        if row_id is None:
             continue
-        point = [category_by_row[row_id], equity_by_row[row_id]]
+        day = snapshot_day_by_row.get(row_id)
+        if day is None or day not in category_by_day:
+            continue
+        marker_point = [category_by_day[day], equity_by_day[day]]
         if item.buy_count:
-            buy_points.append(point)
+            buy_points.append(marker_point)
         if item.sell_count:
-            sell_points.append(point)
+            sell_points.append(marker_point)
+    categories_present = tuple(
+        category
+        for category in InstrumentCategory
+        if any(
+            classifications.get(
+                instrument,
+                classify_instrument(instrument),
+            ).category
+            is category
+            for item in points
+            for instrument in item.position_values
+        )
+    )
     series: list[dict[str, object]] = [
         {
             "name": "账户净值",
             "type": "line",
-            "showSymbol": True,
-            "data": [float(item.snapshot.equity) for item in records],
+            "showSymbol": False,
+            "lineStyle": {"width": 2, "color": "#0f172a"},
+            "data": [float(item.equity) for item in points],
         },
         {
             "name": "现金",
             "type": "bar",
             "stack": "资产",
-            "data": [float(item.snapshot.cash) for item in records],
-        },
-        {
-            "name": "持仓市值",
-            "type": "bar",
-            "stack": "资产",
-            "data": [float(item.snapshot.equity - item.snapshot.cash) for item in records],
+            "itemStyle": {"color": "#cbd5e1"},
+            "data": [float(item.cash) for item in points],
         },
     ]
-    for name, marker, color, position, points in (
+    for category in categories_present:
+        series.append(
+            {
+                "name": f"持仓·{category.value}",
+                "type": "bar",
+                "stack": "资产",
+                "itemStyle": {"color": _CATEGORY_COLORS[category]},
+                "data": [
+                    float(
+                        sum(
+                            (
+                                value
+                                for instrument, value in item.position_values.items()
+                                if classifications.get(
+                                    instrument,
+                                    classify_instrument(instrument),
+                                ).category
+                                is category
+                            ),
+                            Decimal("0"),
+                        )
+                    )
+                    for item in points
+                ],
+            }
+        )
+    for name, marker, color, position, marker_points in (
         ("B 买入成交", "B", "#dc2626", "top", buy_points),
         ("S 卖出成交", "S", "#059669", "bottom", sell_points),
     ):
-        if points:
+        if marker_points:
             series.append(
                 {
                     "name": name,
                     "type": "scatter",
                     "symbolSize": 16,
-                    "data": points,
+                    "data": marker_points,
                     "itemStyle": {"color": color},
                     "label": {
                         "show": True,
@@ -258,12 +318,26 @@ def _fund_chart_options(
 
 
 def _position_chart_options(
-    snapshot: StoredAccountSnapshot,
+    snapshot: AccountSnapshot,
     names: dict[str, str],
+    classifications: Mapping[InstrumentId, InstrumentClassification],
 ) -> dict[str, object]:
-    positions = snapshot.snapshot.positions
+    positions = snapshot.positions
     labels = [names.get(str(item.instrument), str(item.instrument)) for item in positions]
-    values = [float(item.market_value) for item in positions]
+    values = [
+        {
+            "value": float(item.market_value),
+            "itemStyle": {
+                "color": _CATEGORY_COLORS[
+                    classifications.get(
+                        item.instrument,
+                        classify_instrument(item.instrument),
+                    ).category
+                ]
+            },
+        }
+        for item in positions
+    ]
     return {
         "animation": False,
         "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
@@ -275,11 +349,82 @@ def _position_chart_options(
                 "name": "持仓市值",
                 "type": "bar",
                 "data": values,
-                "itemStyle": {"color": "#2563eb"},
                 "label": {"show": True, "position": "right", "formatter": "{c}"},
             }
         ],
     }
+
+
+def _category_chart_options(
+    snapshot: AccountSnapshot,
+    classifications: Mapping[InstrumentId, InstrumentClassification],
+) -> dict[str, object]:
+    totals: dict[InstrumentCategory, Decimal] = {}
+    for position in snapshot.positions:
+        classification = classifications.get(
+            position.instrument,
+            classify_instrument(position.instrument),
+        )
+        totals[classification.category] = (
+            totals.get(classification.category, Decimal("0")) + position.market_value
+        )
+    data = [
+        {
+            "name": category.value,
+            "value": float(totals[category]),
+            "itemStyle": {"color": _CATEGORY_COLORS[category]},
+        }
+        for category in InstrumentCategory
+        if category in totals
+    ]
+    return {
+        "animation": False,
+        "tooltip": {"trigger": "item", "formatter": "{b}<br/>¥{c} · {d}%"},
+        "legend": {"orient": "vertical", "right": 12, "top": "middle"},
+        "series": [
+            {
+                "name": "持仓分类",
+                "type": "pie",
+                "radius": ["42%", "68%"],
+                "center": ["38%", "50%"],
+                "avoidLabelOverlap": True,
+                "label": {"formatter": "{b}\n{d}%"},
+                "data": data,
+            }
+        ],
+    }
+
+
+def _latest_marked_snapshot(
+    stored: StoredAccountSnapshot,
+    instruments: Sequence[SignalInstrumentChoice],
+) -> tuple[AccountSnapshot, tuple[InstrumentId, ...]]:
+    latest = {item.instrument: item for item in instruments}
+    missing: list[InstrumentId] = []
+    positions: list[Position] = []
+    price_days: list[date] = []
+    for position in stored.snapshot.positions:
+        choice = latest.get(position.instrument)
+        if choice is None:
+            missing.append(position.instrument)
+            mark_price = position.mark_price
+        else:
+            mark_price = choice.close
+            price_days.append(choice.data_day)
+        positions.append(
+            Position(
+                position.instrument,
+                position.quantity,
+                position.available_quantity,
+                position.average_cost,
+                mark_price,
+            )
+        )
+    as_of = min(price_days) if price_days else stored.snapshot.as_of
+    return (
+        AccountSnapshot(as_of, stored.snapshot.cash, positions),
+        tuple(sorted(missing, key=str)),
+    )
 
 
 def _impact_chart_options(decisions: Sequence[AccountDecisionAudit]) -> dict[str, object]:
@@ -638,14 +783,35 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
     if state.latest is None:
         return
 
-    latest = state.latest.snapshot
-    market_value = latest.equity - latest.cash
+    latest, missing_prices = _latest_marked_snapshot(state.latest, state.instruments)
+    latest_valuation = state.valuations[-1] if state.valuations else None
+    equity = latest.equity if latest_valuation is None else latest_valuation.equity
+    cash = latest.cash if latest_valuation is None else latest_valuation.cash
+    market_value = equity - cash
+    valuation_day = latest.as_of if latest_valuation is None else latest_valuation.day
+    names = {str(item.instrument): item.name for item in state.instruments}
+    names_by_instrument = {item.instrument: item.name for item in state.instruments}
+    classified_instruments = {
+        position.instrument for position in latest.positions
+    } | {
+        instrument
+        for point in state.valuations
+        for instrument in point.position_values
+    }
+    classifications = {
+        instrument: classify_instrument(
+            instrument,
+            names_by_instrument.get(instrument),
+        )
+        for instrument in classified_instruments
+    }
     with ui.row().classes("w-full gap-3"):
         for label, value in (
-            ("账户净值", f"¥{latest.equity:,.2f}"),
-            ("现金", f"¥{latest.cash:,.2f}"),
+            ("账户净值", f"¥{equity:,.2f}"),
+            ("现金", f"¥{cash:,.2f}"),
             ("持仓市值", f"¥{market_value:,.2f}"),
             ("持仓标的", f"{len(latest.positions)} 个"),
+            ("估值日期", valuation_day.isoformat()),
             ("持仓版本", f"{len(state.history)} 版"),
         ):
             with ui.card().classes("min-w-40 border border-slate-200 shadow-none"):
@@ -654,22 +820,51 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
 
     with ui.card().classes("w-full"):
         ui.label("资金与仓位变化").classes("text-subtitle1 font-semibold")
-        ui.label("按保存持仓或记录成交时形成的快照展示，不代表每个交易日自动盯市。").classes(
-            "text-xs text-grey-6"
-        )
+        ui.label(
+            "持仓数量和现金按保存或成交记录变化；其余交易日使用最新本地收盘行情连续盯市。"
+        ).classes("text-xs text-grey-6")
         ui.label("B / S 分别表示已记录的实际买入 / 卖出成交。").classes(
             "text-xs text-grey-6"
         )
-        ui.echart(_fund_chart_options(state.history, state.decisions)).classes("w-full h-96")
+        if state.valuations:
+            ui.echart(
+                _fund_chart_options(
+                    state.valuations,
+                    state.history,
+                    state.decisions,
+                    classifications,
+                )
+            ).classes("w-full h-96")
+        else:
+            ui.label("暂无可用于账户盯市的行情数据。").classes("text-sm text-grey-6")
 
-    names = {str(item.instrument): item.name for item in state.instruments}
     with ui.card().classes("w-full"):
         ui.label("当前持仓结构").classes("text-subtitle1 font-semibold")
+        ui.label(f"按 {valuation_day.isoformat()} 前可用的最新收盘价估值。").classes(
+            "text-xs text-grey-6"
+        )
+        if missing_prices:
+            ui.label(
+                f"{len(missing_prices)} 个持仓缺少当前行情，暂用最近一次账户快照价格："
+                + "、".join(str(item) for item in missing_prices)
+            ).classes("text-xs text-orange-8")
         if latest.positions:
-            ui.echart(_position_chart_options(state.latest, names)).classes("w-full h-80")
+            with ui.row().classes("w-full gap-4 items-stretch"):
+                with ui.column().classes("grow min-w-[420px]"):
+                    ui.label("按类别汇总").classes("text-sm font-medium text-grey-8")
+                    ui.echart(
+                        _category_chart_options(latest, classifications)
+                    ).classes("w-full h-72")
+                with ui.column().classes("grow min-w-[520px]"):
+                    ui.label("按标的明细").classes("text-sm font-medium text-grey-8")
+                    ui.echart(
+                        _position_chart_options(latest, names, classifications)
+                    ).classes("w-full h-72")
             ui.table(
                 columns=[
                     {"name": "instrument", "label": "标的", "field": "instrument"},
+                    {"name": "category", "label": "类别", "field": "category"},
+                    {"name": "theme", "label": "主题", "field": "theme"},
                     {"name": "quantity", "label": "数量", "field": "quantity", "align": "right"},
                     {"name": "cost", "label": "成本", "field": "cost", "align": "right"},
                     {"name": "price", "label": "现价", "field": "price", "align": "right"},
@@ -679,6 +874,8 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
                 rows=[
                     {
                         "instrument": f"{names.get(str(item.instrument), item.instrument)}（{item.instrument}）",
+                        "category": classifications[item.instrument].category.value,
+                        "theme": classifications[item.instrument].theme,
                         "quantity": item.quantity,
                         "cost": f"¥{item.average_cost:,.4f}",
                         "price": f"¥{item.mark_price:,.4f}",

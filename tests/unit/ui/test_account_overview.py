@@ -6,12 +6,17 @@ from zoneinfo import ZoneInfo
 
 from compass.domain.market import AssetType, InstrumentId
 from compass.domain.trading import AccountSnapshot, Position
-from compass.services.local_signal_center import SignalInstrumentChoice
+from compass.services.instrument_classification import classify_instrument
+from compass.services.local_signal_center import (
+    SignalAccountValuationPoint,
+    SignalInstrumentChoice,
+)
 from compass.storage.account_repository import StoredAccountSnapshot
 from compass.storage.signal_account_repository import SignalAccountProfile
 from compass.ui.pages.account_overview import (
     AccountOverviewPageModel,
     _fund_chart_options,
+    _latest_marked_snapshot,
 )
 
 
@@ -60,6 +65,22 @@ class Gateway:
     def account_history(self):  # type: ignore[no-untyped-def]
         return self.snapshots
 
+    def account_valuation_history(self):  # type: ignore[no-untyped-def]
+        return tuple(
+            SignalAccountValuationPoint(
+                item.snapshot.as_of,
+                item.snapshot.cash,
+                item.snapshot.equity - item.snapshot.cash,
+                item.snapshot.equity,
+                item.row_id,
+                {
+                    position.instrument: position.market_value
+                    for position in item.snapshot.positions
+                },
+            )
+            for item in self.snapshots
+        )
+
     def compact_account_history(self):  # type: ignore[no-untyped-def]
         self.compacted = True
         return 1
@@ -84,17 +105,38 @@ def test_account_overview_exposes_shared_holdings_history() -> None:
     assert state.active_profile.account_id == "main"
     assert state.latest == state.history[-1]
     assert len(state.history) == 2
+    assert len(state.valuations) == 2
     assert state.decisions == ()
 
 
 def test_account_fund_chart_combines_cash_market_value_and_equity() -> None:
-    snapshots = Gateway().snapshots
-    options = _fund_chart_options(snapshots, ())
+    gateway = Gateway()
+    options = _fund_chart_options(
+        gateway.account_valuation_history(),
+        gateway.snapshots,
+        (),
+        {ETF: classify_instrument(ETF, "沪深300ETF")},
+    )
 
-    assert options["legend"] == {"data": ["账户净值", "现金", "持仓市值"], "top": 8}
+    assert options["legend"] == {
+        "data": ["账户净值", "现金", "持仓·宽基"],
+        "top": 8,
+    }
     series = options["series"]
     assert isinstance(series, list)
-    assert [item["name"] for item in series] == ["账户净值", "现金", "持仓市值"]
+    assert [item["name"] for item in series] == ["账户净值", "现金", "持仓·宽基"]
+
+
+def test_account_current_position_is_marked_with_latest_market_close() -> None:
+    gateway = Gateway()
+
+    snapshot, missing = _latest_marked_snapshot(
+        _stored(3, "9000.00", "4.1"), gateway.instruments()
+    )
+
+    assert snapshot.as_of == date(2026, 8, 11)
+    assert snapshot.positions[0].mark_price == Decimal("4.2")
+    assert missing == ()
 
 
 def test_account_overview_saves_position_configuration_through_shared_gateway() -> None:

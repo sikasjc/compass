@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, DecimalException
 from numbers import Number
+from types import MappingProxyType
 
 from compass.data.base import default_instrument_type
 from compass.domain.market import AssetType, InstrumentId
@@ -86,6 +88,54 @@ class SignalDecisionComparison:
     adopted_return: Decimal
     ignored_return: Decimal
     relative_impact: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class SignalAccountValuationPoint:
+    day: date
+    cash: Decimal
+    market_value: Decimal
+    equity: Decimal
+    source_snapshot_row_id: int
+    position_values: Mapping[InstrumentId, Decimal]
+
+    def __post_init__(self) -> None:
+        if type(self.day) is not date:
+            raise TypeError("valuation day must be an exact date")
+        for label, value in (
+            ("cash", self.cash),
+            ("market value", self.market_value),
+            ("equity", self.equity),
+        ):
+            if type(value) is not Decimal or not value.is_finite() or value < 0:
+                raise ValueError(f"valuation {label} must be finite and non-negative")
+            if value != value.quantize(Decimal("0.01")):
+                raise ValueError(f"valuation {label} must use cents")
+        if self.cash + self.market_value != self.equity:
+            raise ValueError("valuation components must add up to equity")
+        if (
+            isinstance(self.source_snapshot_row_id, bool)
+            or not isinstance(self.source_snapshot_row_id, int)
+            or self.source_snapshot_row_id <= 0
+        ):
+            raise ValueError("valuation source snapshot id must be positive")
+        values = dict(self.position_values)
+        if any(
+            type(instrument) is not InstrumentId
+            or type(value) is not Decimal
+            or not value.is_finite()
+            or value < 0
+            or value != value.quantize(Decimal("0.01"))
+            for instrument, value in values.items()
+        ):
+            raise ValueError("valuation position values are invalid")
+        if sum(values.values(), Decimal("0")) != self.market_value:
+            raise ValueError("valuation position values must add up to market value")
+        object.__setattr__(
+            self,
+            "position_values",
+            MappingProxyType(dict(sorted(values.items(), key=lambda item: str(item[0])))),
+        )
 
 
 def _decimal(value: object, *, label: str, cents: bool = False) -> Decimal:
@@ -254,6 +304,113 @@ class LocalSignalCenter:
 
     def account_history(self) -> tuple[StoredAccountSnapshot, ...]:
         return self._active_accounts().history()
+
+    def account_valuation_history(self) -> tuple[SignalAccountValuationPoint, ...]:
+        records = tuple(
+            sorted(
+                self._active_accounts().history(),
+                key=lambda item: (item.snapshot.as_of, item.row_id),
+            )
+        )
+        if not records:
+            return ()
+        bundle = self._bundles.latest()
+        if bundle is None:
+            latest_by_day = {item.snapshot.as_of: item for item in records}
+            return tuple(
+                SignalAccountValuationPoint(
+                    item.snapshot.as_of,
+                    item.snapshot.cash,
+                    item.snapshot.equity - item.snapshot.cash,
+                    item.snapshot.equity,
+                    item.row_id,
+                    {
+                        position.instrument: position.market_value
+                        for position in item.snapshot.positions
+                    },
+                )
+                for item in latest_by_day.values()
+            )
+        references = self._bundles.references_by_instrument(bundle)
+        required = tuple(
+            sorted(
+                {
+                    position.instrument
+                    for record in records
+                    for position in record.snapshot.positions
+                },
+                key=str,
+            )
+        )
+        selected = tuple(item for item in required if item in references)
+        if not selected:
+            selected = (bundle.instruments[0],)
+        price_days: dict[InstrumentId, tuple[date, ...]] = {}
+        prices: dict[InstrumentId, tuple[Decimal, ...]] = {}
+        market_days: set[date] = set()
+        for instrument in selected:
+            frame = self._bundles.read_manifest(references[instrument].manifest_id)
+            rows = tuple(
+                (timestamp.date(), _decimal(row["close"], label="valuation close"))
+                for timestamp, row in frame.iterrows()
+            )
+            if not rows:
+                continue
+            price_days[instrument] = tuple(item[0] for item in rows)
+            prices[instrument] = tuple(item[1] for item in rows)
+            market_days.update(price_days[instrument])
+        first_day = records[0].snapshot.as_of
+        valuation_days = tuple(
+            sorted(
+                {item.snapshot.as_of for item in records}
+                | {day for day in market_days if day >= first_day}
+            )
+        )
+        points: list[SignalAccountValuationPoint] = []
+        record_index = 0
+        active: StoredAccountSnapshot | None = None
+        for day in valuation_days:
+            while (
+                record_index < len(records)
+                and records[record_index].snapshot.as_of <= day
+            ):
+                active = records[record_index]
+                record_index += 1
+            if active is None:
+                continue
+            marked_positions: list[Position] = []
+            for position in active.snapshot.positions:
+                days = price_days.get(position.instrument)
+                values = prices.get(position.instrument)
+                mark_price = position.mark_price
+                if days is not None and values is not None:
+                    price_index = bisect_right(days, day) - 1
+                    if price_index >= 0:
+                        mark_price = values[price_index]
+                marked_positions.append(
+                    Position(
+                        position.instrument,
+                        position.quantity,
+                        position.available_quantity,
+                        position.average_cost,
+                        mark_price,
+                    )
+                )
+            valuation = AccountSnapshot(day, active.snapshot.cash, marked_positions)
+            points.append(
+                SignalAccountValuationPoint(
+                    day,
+                    valuation.cash,
+                    valuation.equity - valuation.cash,
+                    valuation.equity,
+                    active.row_id,
+                    {
+                        position.instrument: position.market_value
+                        for position in valuation.positions
+                    },
+                )
+            )
+        return tuple(points)
 
     def compact_account_history(self) -> int:
         protected = self._decisions.referenced_account_snapshot_ids().union(

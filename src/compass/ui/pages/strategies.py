@@ -22,8 +22,9 @@ from compass.services.safe_display import (
     stable_code,
 )
 from compass.services.task_manager import Operation, TaskSnapshot, TaskStatus
-from compass.strategies.base import StrategyFrequency, StrategyMetadata
+from compass.strategies.base import HoldingSummary, StrategyFrequency, StrategyMetadata
 from compass.strategies.registry import StrategyRegistry
+from compass.strategies.kronos_forecast import KronosForecastParameters
 from compass.strategies.rule_document import (
     RuleSide,
     RuleStrategyDraft,
@@ -31,7 +32,13 @@ from compass.strategies.rule_document import (
     default_rule_document,
     document_from_parameters,
 )
-from compass.strategies.rule_dsl import RuleDslParameters
+from compass.strategies.rule_dsl import (
+    DslAction,
+    DslExecutableRule,
+    RuleDslParameters,
+    dsl_action_target,
+    rule_dsl_state,
+)
 
 if TYPE_CHECKING:
     from compass.services.strategy_optimizer import (
@@ -557,8 +564,10 @@ class RulePreviewSignal:
     day: date
     instrument: InstrumentId
     side: RuleSide
+    action: DslAction
     rule_id: str
     rule_name: str
+    overridden_rule_ids: tuple[str, ...]
     priority: int
     target_weight: Decimal
     close: Decimal
@@ -568,8 +577,16 @@ class RulePreviewSignal:
             raise TypeError("rule preview identity is invalid")
         if type(self.side) is not RuleSide:
             raise TypeError("rule preview side must be exact")
+        if type(self.action) is not DslAction:
+            raise TypeError("rule preview action must be exact")
         safe_identifier(self.rule_id, label="preview rule id")
         safe_display_text(self.rule_name, label="preview rule name")
+        overridden = tuple(self.overridden_rule_ids)
+        if any(type(item) is not str for item in overridden):
+            raise TypeError("preview overridden rule ids must be strings")
+        for item in overridden:
+            safe_identifier(item, label="preview overridden rule id")
+        object.__setattr__(self, "overridden_rule_ids", overridden)
         if type(self.priority) is not int:
             raise TypeError("preview priority must be exact")
         if (
@@ -871,33 +888,68 @@ class StrategyPageModel:
         compiled = document.compiled_rules()
         signals: list[RulePreviewSignal] = []
         active_weight = Decimal("0")
+        entry_price: Decimal | None = None
+        entry_day: date | None = None
         for position in range(document.minimum_history - 1, len(frame)):
             visible = frame.iloc[: position + 1]
+            timestamp = frame.index[position]
+            if not isinstance(timestamp, pd.Timestamp):
+                timestamp = pd.Timestamp(timestamp)
+            close = Decimal(str(frame.iloc[position]["close"]))
+            holding = (
+                None
+                if active_weight <= 0 or entry_price is None
+                else HoldingSummary(
+                    instrument,
+                    1,
+                    1,
+                    entry_price,
+                    close,
+                    entry_day,
+                )
+            )
+            state = rule_dsl_state(visible, timestamp.date(), holding)
             matches = [
                 rule
                 for rule, program in compiled
-                if program.evaluate(visible, document.variable_values)
+                if program.evaluate(visible, document.variable_values, state)
             ]
             if not matches:
                 continue
             winner = matches[0]
-            target = Decimal("0") if winner.side is RuleSide.SELL else document.target_weight
+            assert winner.action is not None
+            target = dsl_action_target(
+                DslExecutableRule(
+                    rule_id=winner.rule_id,
+                    name=winner.name,
+                    priority=winner.priority,
+                    expression=winner.expression,
+                    action=winner.action,
+                    value=winner.target_weight,
+                ),
+                active_weight,
+            )
             if target == active_weight:
                 continue
+            if active_weight <= 0 < target:
+                entry_price = close
+                entry_day = timestamp.date()
+            elif target <= 0:
+                entry_price = None
+                entry_day = None
             active_weight = target
-            timestamp = frame.index[position]
-            if not isinstance(timestamp, pd.Timestamp):
-                timestamp = pd.Timestamp(timestamp)
             signals.append(
                 RulePreviewSignal(
                     day=timestamp.date(),
                     instrument=instrument,
                     side=winner.side,
+                    action=winner.resolved_action,
                     rule_id=winner.rule_id,
                     rule_name=winner.name,
+                    overridden_rule_ids=tuple(item.rule_id for item in matches[1:]),
                     priority=winner.priority,
                     target_weight=target,
-                    close=Decimal(str(frame.iloc[position]["close"])),
+                    close=close,
                 )
             )
         first = pd.Timestamp(frame.index[0]).date()
@@ -1592,22 +1644,35 @@ def _render_optimization_section(
 
     if not model.optimization_available():
         return
+    supported_types = {"dual_ma", "rule_dsl", "kronos_forecast"}
     candidates = tuple(
-        item for item in state.instances if item.enabled and item.strategy_type == "dual_ma"
+        item
+        for item in state.instances
+        if item.enabled and item.strategy_type in supported_types
     )
     ui.separator().classes("my-6")
     ui.label("策略调优实验").classes("text-xl font-semibold")
     ui.label(
-        "第一期对双均线的短周期、长周期和确认天数做网格搜索。数据按时间顺序切成 "
-        "60% 训练、20% 验证、20% 冻结测试；只有验证集排名第一的候选会查看冻结测试。"
+        "支持双均线、DSL 导出变量和 Kronos 仓位转换参数的网格搜索。数据按时间顺序切成 "
+        "40% 基础训练、40% 三段滚动验证、20% 冻结测试；只有稳健评分第一的候选会查看冻结测试。"
     ).classes("text-sm text-slate-600")
     if not candidates:
-        ui.label("请先创建并启用一个双均线策略模板。需要至少约一年的本地行情。").classes(
+        ui.label("请先创建并启用一个可调优的策略模板。需要至少约一年的本地行情。").classes(
             "text-amber-700"
         )
         return
 
-    options = {item.instance_id: f"{item.name}（v{item.version}）" for item in candidates}
+    strategy_names = {
+        "dual_ma": "双均线",
+        "rule_dsl": "自定义 DSL",
+        "kronos_forecast": "Kronos",
+    }
+    options = {
+        item.instance_id: (
+            f"{item.name}（{strategy_names[item.strategy_type]} · v{item.version}）"
+        )
+        for item in candidates
+    }
     source = ui.select(
         options,
         value=candidates[0].instance_id,
@@ -1632,14 +1697,92 @@ def _render_optimization_section(
         except Exception:
             ui.notify("无法读取该策略标的的共同数据区间。", type="negative")
 
-    source.on_value_change(lambda _: update_range())
-    with ui.row().classes("w-full gap-4 items-end"):
-        short_input = ui.input("短均线候选", value="10,20,30")
-        long_input = ui.input("长均线候选", value="40,60,90")
-        confirmation_input = ui.input("确认天数候选", value="1,2,3")
-    ui.label("候选值用逗号分隔，例如 10,20,30。短均线必须小于长均线。").classes(
-        "text-xs text-slate-500"
-    )
+    candidate_by_id = {item.instance_id: item for item in candidates}
+    parameter_inputs: dict[str, Any] = {}
+
+    @ui.refreshable
+    def search_space_form() -> None:
+        parameter_inputs.clear()
+        selected = candidate_by_id[str(source.value)]
+        if selected.strategy_type == "dual_ma":
+            with ui.row().classes("w-full gap-4 items-end"):
+                parameter_inputs["short_window"] = ui.input(
+                    "短均线候选", value="10,20,30"
+                )
+                parameter_inputs["long_window"] = ui.input(
+                    "长均线候选", value="40,60,90"
+                )
+                parameter_inputs["confirmation_days"] = ui.input(
+                    "确认天数候选", value="1,2,3"
+                )
+            ui.label("短均线必须小于长均线。").classes("text-xs text-slate-500")
+        elif selected.strategy_type == "rule_dsl":
+            parsed_rule = RuleDslParameters.model_validate_json(
+                strategy_parameters_json(selected.parameters), strict=True
+            )
+            if not parsed_rule.optimization_variables:
+                ui.label("该 DSL 策略没有标记为“参与优化”的导出变量。").classes(
+                    "text-amber-700"
+                )
+            with ui.row().classes("w-full gap-4 items-end flex-wrap"):
+                for variable in parsed_rule.optimization_variables:
+                    stepped: list[Decimal] = []
+                    candidate = variable.minimum
+                    while candidate <= variable.maximum and len(stepped) <= 5:
+                        stepped.append(candidate)
+                        candidate += variable.step
+                    defaults = (
+                        tuple(stepped)
+                        if candidate > variable.maximum
+                        else tuple(
+                            sorted({variable.minimum, variable.value, variable.maximum})
+                        )
+                    )
+                    parameter_inputs[f"variable.{variable.name}"] = ui.input(
+                        f"{variable.name} 候选",
+                        value=",".join(str(item) for item in defaults),
+                    )
+            ui.label(
+                "默认按变量步长生成候选；范围较大时取最小值、当前值和最大值，可自行调整。"
+            ).classes("text-xs text-slate-500")
+        else:
+            parsed_kronos = KronosForecastParameters.model_validate_json(
+                strategy_parameters_json(selected.parameters), strict=True
+            )
+            with ui.row().classes("w-full gap-4 items-end flex-wrap"):
+                parameter_inputs["entry_return"] = ui.input(
+                    "买入阈值候选（%）",
+                    value=f"0,1,{float(parsed_kronos.entry_return) * 100:g}",
+                )
+                parameter_inputs["exit_return"] = ui.input(
+                    "退出阈值候选（%）",
+                    value=f"-2,{float(parsed_kronos.exit_return) * 100:g}",
+                )
+                parameter_inputs["minimum_path_positive_ratio"] = ui.input(
+                    "正向路径比例候选（%）",
+                    value=f"50,{float(parsed_kronos.minimum_path_positive_ratio) * 100:g}",
+                )
+                parameter_inputs["trend_window"] = ui.input(
+                    "趋势窗口候选（日）",
+                    value=f"20,{parsed_kronos.trend_window}",
+                )
+                parameter_inputs["rebalance_interval"] = ui.input(
+                    "重算间隔候选（日）",
+                    value=str(parsed_kronos.rebalance_interval),
+                )
+            ui.label(
+                "先优化信号转仓位参数；模型规模、采样配置和预测周期保持当前模板值。预测缓存会复用相同日期的模型结果。"
+            ).classes("text-xs text-slate-500")
+        ui.label("候选值用逗号分隔，全部组合最多 50 组。").classes(
+            "text-xs text-slate-500"
+        )
+
+    def change_source() -> None:
+        update_range()
+        search_space_form.refresh()
+
+    source.on_value_change(lambda _: change_source())
+    search_space_form()
     feedback = ui.label("").classes("text-sm text-red-700")
 
     def parse_values(raw: object) -> tuple[int, ...]:
@@ -1647,13 +1790,57 @@ def _render_optimization_section(
             raise ValueError
         return tuple(sorted({int(item.strip()) for item in raw.split(",") if item.strip()}))
 
+    def parse_decimals(raw: object, *, percent: bool = False) -> tuple[Decimal, ...]:
+        if type(raw) is not str:
+            raise ValueError
+        scale = Decimal("100") if percent else Decimal("1")
+        return tuple(
+            sorted(
+                {
+                    Decimal(item.strip()) / scale
+                    for item in raw.split(",")
+                    if item.strip()
+                }
+            )
+        )
+
     def start_experiment() -> None:
         try:
-            search_space = OptimizationSearchSpace(
-                parse_values(short_input.value),
-                parse_values(long_input.value),
-                parse_values(confirmation_input.value),
-            )
+            selected = candidate_by_id[str(source.value)]
+            if selected.strategy_type == "dual_ma":
+                search_space = OptimizationSearchSpace.dual_ma(
+                    parse_values(parameter_inputs["short_window"].value),
+                    parse_values(parameter_inputs["long_window"].value),
+                    parse_values(parameter_inputs["confirmation_days"].value),
+                )
+            elif selected.strategy_type == "rule_dsl":
+                search_space = OptimizationSearchSpace(
+                    {
+                        name: parse_decimals(element.value)
+                        for name, element in parameter_inputs.items()
+                    }
+                )
+            else:
+                search_space = OptimizationSearchSpace(
+                    {
+                        "entry_return": parse_decimals(
+                            parameter_inputs["entry_return"].value, percent=True
+                        ),
+                        "exit_return": parse_decimals(
+                            parameter_inputs["exit_return"].value, percent=True
+                        ),
+                        "minimum_path_positive_ratio": parse_decimals(
+                            parameter_inputs["minimum_path_positive_ratio"].value,
+                            percent=True,
+                        ),
+                        "trend_window": parse_values(
+                            parameter_inputs["trend_window"].value
+                        ),
+                        "rebalance_interval": parse_values(
+                            parameter_inputs["rebalance_interval"].value
+                        ),
+                    }
+                )
             model.start_optimization(
                 OptimizationRequest(
                     str(source.value),
@@ -1711,15 +1898,14 @@ def _render_optimization_section(
             detail = phase_labels[progress.phase]
             if progress.phase in {"training", "validation"}:
                 detail += f" · 参数 {progress.current_trial}/{progress.trial_count}"
-            if progress.short_window is not None:
-                detail += (
-                    f" · 短 {progress.short_window} / 长 {progress.long_window} / "
-                    f"确认 {progress.confirmation_days} 天"
-                )
+            if progress.phase == "validation":
+                detail += f" · 验证窗口 {progress.current_fold}/{progress.fold_count}"
+            if progress.parameters:
+                detail += f" · {progress.parameter_text}"
             ui.label(detail).classes("text-sm font-medium text-slate-700")
             ui.linear_progress(value=progress.fraction).classes("w-full max-w-3xl")
             ui.label(
-                "每组参数会先运行训练区间，再运行验证区间；因此同一个参数编号会显示两个阶段。"
+                "每组参数先运行基础训练区间，再依次运行 3 个滚动验证窗口；排名会惩罚窗口间波动。"
             ).classes("text-xs text-slate-500")
         if task.status in active_statuses:
 
@@ -1749,9 +1935,16 @@ def _render_optimization_section(
             with ui.row().classes("w-full justify-between items-start gap-3"):
                 with ui.column().classes("gap-1"):
                     ui.label(experiment.source_name).classes("font-semibold")
+                    fold_count = len(experiment.trials[0].validation_folds)
                     ui.label(
                         f"{experiment.start} 至 {experiment.end} · "
-                        f"训练截至 {experiment.training_end} · 验证截至 {experiment.validation_end}"
+                        + (
+                            f"基础训练截至 {experiment.training_end} · {fold_count} 个滚动验证窗口截至 "
+                            f"{experiment.validation_end}"
+                            if fold_count
+                            else f"旧版单次验证 · 训练截至 {experiment.training_end} · "
+                            f"验证截至 {experiment.validation_end}"
+                        )
                     ).classes("text-sm text-slate-600")
                 if experiment.published_instance_id is None:
 
@@ -1783,15 +1976,26 @@ def _render_optimization_section(
                 rows.append(
                     {
                         "rank": trial.rank,
-                        "parameters": (
-                            f"{trial.short_window}/{trial.long_window}/{trial.confirmation_days}"
-                        ),
+                        "parameters": trial.parameter_text,
                         "training": percent(trial.training.total_return),
                         "validation": percent(trial.validation.total_return),
+                        "folds": (
+                            " / ".join(
+                                percent(item.metrics.total_return)
+                                for item in trial.validation_folds
+                            )
+                            if trial.validation_folds
+                            else "旧版"
+                        ),
                         "calmar": (
                             "—"
                             if trial.validation.calmar_ratio is None
                             else f"{trial.validation.calmar_ratio:.2f}"
+                        ),
+                        "robust_score": (
+                            f"{trial.score:.2f}"
+                            if trial.eligible and trial.validation_folds
+                            else "—"
                         ),
                         "drawdown": percent(trial.validation.maximum_drawdown),
                         "trades": trial.validation.trade_count,
@@ -1808,10 +2012,12 @@ def _render_optimization_section(
             result_table = ui.table(
                 columns=[
                     {"name": "rank", "label": "排名", "field": "rank", "align": "left"},
-                    {"name": "parameters", "label": "短/长/确认", "field": "parameters"},
+                    {"name": "parameters", "label": "参数组合", "field": "parameters"},
                     {"name": "training", "label": "训练收益", "field": "training"},
                     {"name": "validation", "label": "验证收益", "field": "validation"},
+                    {"name": "folds", "label": "各窗口收益", "field": "folds"},
                     {"name": "calmar", "label": "验证 Calmar", "field": "calmar"},
+                    {"name": "robust_score", "label": "稳健评分", "field": "robust_score"},
                     {"name": "drawdown", "label": "验证回撤", "field": "drawdown"},
                     {"name": "trades", "label": "验证成交", "field": "trades"},
                     {"name": "test", "label": "冻结测试收益", "field": "test"},
@@ -1826,18 +2032,26 @@ def _render_optimization_section(
                 """
                 <q-tr :props="props">
                     <q-th key="rank" :props="props">排名</q-th>
-                    <q-th key="parameters" :props="props">短/长/确认</q-th>
+                    <q-th key="parameters" :props="props">参数组合</q-th>
                     <q-th key="training" :props="props">
                         训练收益 <span class="q-ml-xs cursor-help fq-help-circle">?</span>
-                        <q-tooltip max-width="320px">参数在前 60% 训练区间的累计收益。用于观察历史拟合效果，不能单独证明策略有效。</q-tooltip>
+                        <q-tooltip max-width="320px">参数在前 40% 基础训练区间的累计收益。用于观察早期历史表现，不能单独证明策略有效。</q-tooltip>
                     </q-th>
                     <q-th key="validation" :props="props">
                         验证收益 <span class="q-ml-xs cursor-help fq-help-circle">?</span>
-                        <q-tooltip max-width="320px">同一参数在随后 20% 验证区间的累计收益。越高通常越好；若明显弱于训练收益，可能存在过拟合。</q-tooltip>
+                        <q-tooltip max-width="320px">随后 40% 被切成 3 个连续窗口，此处显示各窗口收益中位数；至少两个窗口必须有成交。</q-tooltip>
+                    </q-th>
+                    <q-th key="folds" :props="props">
+                        各窗口收益 <span class="q-ml-xs cursor-help fq-help-circle">?</span>
+                        <q-tooltip max-width="320px">按时间先后展示 3 个滚动验证窗口的收益，用来识别只在单一阶段有效的参数。</q-tooltip>
                     </q-th>
                     <q-th key="calmar" :props="props">
                         验证 Calmar <span class="q-ml-xs cursor-help fq-help-circle">?</span>
-                        <q-tooltip max-width="320px">验证区间的年化收益与最大回撤之比，越高通常越好。成交很少或区间较短时需要谨慎解读。</q-tooltip>
+                        <q-tooltip max-width="320px">3 个滚动窗口 Calmar 的中位数，越高通常越好。成交很少或区间较短时需要谨慎解读。</q-tooltip>
+                    </q-th>
+                    <q-th key="robust_score" :props="props">
+                        稳健评分 <span class="q-ml-xs cursor-help fq-help-circle">?</span>
+                        <q-tooltip max-width="320px">滚动窗口 Calmar（不足时使用收益）的中位数减去标准差。表现越稳定、窗口间差异越小，分数越高。</q-tooltip>
                     </q-th>
                     <q-th key="drawdown" :props="props">验证回撤</q-th>
                     <q-th key="trades" :props="props">验证成交</q-th>
