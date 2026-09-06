@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal, DecimalException
+from enum import StrEnum
 import json
 import os
 from pathlib import Path
@@ -17,7 +18,7 @@ from compass.storage.canonical_json import (
 )
 
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 def _decimal(value: object, *, label: str) -> Decimal:
@@ -53,6 +54,44 @@ class SignalAccountStrategySetting:
             raise ValueError("strategy budget must be in (0, 1]")
 
 
+class ShadowExecutionTiming(StrEnum):
+    NEXT_OPEN = "next_open"
+    DECISION_CLOSE = "decision_close"
+
+
+@dataclass(frozen=True, slots=True)
+class SignalShadowSimulationSetting:
+    start_snapshot_row_id: int
+    execution_timing: ShadowExecutionTiming = ShadowExecutionTiming.NEXT_OPEN
+    commission_rate: Decimal = Decimal("0.0003")
+    minimum_commission: Decimal = Decimal("5")
+    slippage_bps: int = 2
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.start_snapshot_row_id, bool)
+            or not isinstance(self.start_snapshot_row_id, int)
+            or self.start_snapshot_row_id <= 0
+        ):
+            raise ValueError("shadow start snapshot id must be positive")
+        if type(self.execution_timing) is not ShadowExecutionTiming:
+            raise TypeError("shadow execution timing must be exact")
+        for label, value in (
+            ("commission rate", self.commission_rate),
+            ("minimum commission", self.minimum_commission),
+        ):
+            if type(value) is not Decimal or not value.is_finite() or value < 0:
+                raise ValueError(f"shadow {label} must be finite and non-negative")
+        if self.commission_rate > Decimal("0.01"):
+            raise ValueError("shadow commission rate is too large")
+        if (
+            isinstance(self.slippage_bps, bool)
+            or not isinstance(self.slippage_bps, int)
+            or not 0 <= self.slippage_bps <= 1000
+        ):
+            raise ValueError("shadow slippage bps must be between 0 and 1000")
+
+
 @dataclass(frozen=True, slots=True)
 class SignalAccountProfile:
     account_id: str
@@ -61,6 +100,7 @@ class SignalAccountProfile:
     cash_reserve: Decimal = Decimal("0.10")
     minimum_trade_amount: Decimal = Decimal("5000")
     holdings_account_id: str | None = None
+    shadow_simulation: SignalShadowSimulationSetting | None = None
 
     def __post_init__(self) -> None:
         safe_identifier(self.account_id, label="signal account id")
@@ -91,6 +131,10 @@ class SignalAccountProfile:
             "1"
         ):
             raise ValueError("account strategy budgets exceed available capital")
+        if self.shadow_simulation is not None and type(
+            self.shadow_simulation
+        ) is not SignalShadowSimulationSetting:
+            raise TypeError("shadow simulation setting must be exact or None")
         object.__setattr__(self, "strategies", strategies)
         object.__setattr__(self, "holdings_account_id", holdings_account_id)
 
@@ -231,9 +275,39 @@ class SignalAccountRepository:
                 cash_reserve,
                 minimum_trade_amount,
                 existing.holdings_account_id,
+                existing.shadow_simulation,
             )
             profiles = tuple(
                 updated_profile if item.account_id == checked else item for item in state.profiles
+            )
+            self._write(SignalAccountRegistryState(state.active_account_id, profiles))
+            return updated_profile
+
+    def save_shadow_simulation(
+        self,
+        account_id: str,
+        setting: SignalShadowSimulationSetting | None,
+    ) -> SignalAccountProfile:
+        checked = safe_identifier(account_id, label="signal account id")
+        if setting is not None and type(setting) is not SignalShadowSimulationSetting:
+            raise TypeError("shadow simulation setting must be exact or None")
+        with self._lock:
+            state = self._read()
+            existing = next((item for item in state.profiles if item.account_id == checked), None)
+            if existing is None:
+                raise LookupError("SIGNAL_ACCOUNT_NOT_FOUND")
+            updated_profile = SignalAccountProfile(
+                existing.account_id,
+                existing.name,
+                existing.strategies,
+                existing.cash_reserve,
+                existing.minimum_trade_amount,
+                existing.holdings_account_id,
+                setting,
+            )
+            profiles = tuple(
+                updated_profile if item.account_id == checked else item
+                for item in state.profiles
             )
             self._write(SignalAccountRegistryState(state.active_account_id, profiles))
             return updated_profile
@@ -250,7 +324,7 @@ class SignalAccountRepository:
             if set(payload) != {"active_account_id", "profiles", "schema_version"}:
                 raise ValueError
             schema_version = payload["schema_version"]
-            if schema_version not in {1, _SCHEMA_VERSION}:
+            if schema_version not in {1, 2, _SCHEMA_VERSION}:
                 raise ValueError
             active_account_id = payload["active_account_id"]
             if type(active_account_id) is not str:
@@ -268,6 +342,10 @@ class SignalAccountRepository:
                     "strategies",
                 }
                 if schema_version == _SCHEMA_VERSION:
+                    expected_profile_fields.update(
+                        {"holdings_account_id", "shadow_simulation"}
+                    )
+                elif schema_version == 2:
                     expected_profile_fields.add("holdings_account_id")
                 if type(raw_profile) is not dict or set(raw_profile) != expected_profile_fields:
                     raise ValueError
@@ -299,6 +377,12 @@ class SignalAccountRepository:
                             if schema_version == 1
                             else raw_profile["holdings_account_id"]
                         ),
+                        (
+                            None
+                            if schema_version < _SCHEMA_VERSION
+                            or raw_profile["shadow_simulation"] is None
+                            else self._shadow_setting(raw_profile["shadow_simulation"])
+                        ),
                     )
                 )
             return SignalAccountRegistryState(active_account_id, tuple(profiles))
@@ -316,6 +400,23 @@ class SignalAccountRepository:
                         "holdings_account_id": profile.holdings_account_id,
                         "minimum_trade_amount": _decimal_text(profile.minimum_trade_amount),
                         "name": profile.name,
+                        "shadow_simulation": (
+                            None
+                            if profile.shadow_simulation is None
+                            else {
+                                "commission_rate": _decimal_text(
+                                    profile.shadow_simulation.commission_rate
+                                ),
+                                "execution_timing": profile.shadow_simulation.execution_timing.value,
+                                "minimum_commission": _decimal_text(
+                                    profile.shadow_simulation.minimum_commission
+                                ),
+                                "slippage_bps": profile.shadow_simulation.slippage_bps,
+                                "start_snapshot_row_id": (
+                                    profile.shadow_simulation.start_snapshot_row_id
+                                ),
+                            }
+                        ),
                         "strategies": [
                             {
                                 "budget": _decimal_text(setting.budget),
@@ -342,3 +443,22 @@ class SignalAccountRepository:
             os.replace(temporary, self._path)
         finally:
             temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _shadow_setting(value: object) -> SignalShadowSimulationSetting:
+        if type(value) is not dict or set(value) != {
+            "commission_rate",
+            "execution_timing",
+            "minimum_commission",
+            "slippage_bps",
+            "start_snapshot_row_id",
+        }:
+            raise ValueError("shadow simulation setting shape is invalid")
+        assert isinstance(value, dict)
+        return SignalShadowSimulationSetting(
+            value["start_snapshot_row_id"],
+            ShadowExecutionTiming(value["execution_timing"]),
+            _decimal(value["commission_rate"], label="shadow commission rate"),
+            _decimal(value["minimum_commission"], label="shadow minimum commission"),
+            value["slippage_bps"],
+        )

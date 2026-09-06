@@ -6,8 +6,10 @@ import json
 import pytest
 
 from compass.storage.signal_account_repository import (
+    ShadowExecutionTiming,
     SignalAccountRepository,
     SignalAccountStrategySetting,
+    SignalShadowSimulationSetting,
 )
 from compass.storage.canonical_json import canonical_json, content_hash
 
@@ -63,6 +65,7 @@ def test_signal_account_registry_migrates_version_one_profiles_to_independent_ho
     payload["schema_version"] = 1
     for profile in payload["profiles"]:
         profile.pop("holdings_account_id")
+        profile.pop("shadow_simulation")
     payload_json = canonical_json(payload)
     path.write_text(
         canonical_json(
@@ -74,6 +77,30 @@ def test_signal_account_registry_migrates_version_one_profiles_to_independent_ho
     migrated = SignalAccountRepository(path).state().active
 
     assert migrated.holdings_account_id == "main"
+
+
+def test_signal_account_registry_reads_version_two_without_shadow_settings(
+    tmp_path,
+) -> None:
+    path = tmp_path / "signal_accounts.json"
+    SignalAccountRepository(path)
+    wrapper = json.loads(path.read_text("utf-8"))
+    payload = json.loads(wrapper["payload_json"])
+    payload["schema_version"] = 2
+    for profile in payload["profiles"]:
+        profile.pop("shadow_simulation")
+    payload_json = canonical_json(payload)
+    path.write_text(
+        canonical_json(
+            {"content_hash": content_hash(payload_json), "payload_json": payload_json}
+        ),
+        "utf-8",
+    )
+
+    restored = SignalAccountRepository(path).state().active
+
+    assert restored.holdings_account_id == "main"
+    assert restored.shadow_simulation is None
 
 
 def test_signal_account_registry_delete_switches_active_and_keeps_one(tmp_path) -> None:
@@ -101,3 +128,28 @@ def test_signal_account_registry_detects_tampering(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="SIGNAL_ACCOUNT_REGISTRY_INTEGRITY"):
         repository.state()
+
+
+def test_signal_account_registry_persists_shadow_simulation_settings(tmp_path) -> None:
+    path = tmp_path / "signal_accounts.json"
+    repository = SignalAccountRepository(path)
+    setting = SignalShadowSimulationSetting(
+        7,
+        ShadowExecutionTiming.NEXT_OPEN,
+        Decimal("0.0003"),
+        Decimal("5"),
+        2,
+    )
+
+    saved = repository.save_shadow_simulation("main", setting)
+
+    assert saved.shadow_simulation == setting
+    assert SignalAccountRepository(path).state().active.shadow_simulation == setting
+    configured = repository.save_configuration(
+        "main",
+        (SignalAccountStrategySetting("strategy-a", Decimal("0.5")),),
+        cash_reserve=Decimal("0.2"),
+        minimum_trade_amount=Decimal("3000"),
+    )
+    assert configured.shadow_simulation == setting
+    assert repository.save_shadow_simulation("main", None).shadow_simulation is None

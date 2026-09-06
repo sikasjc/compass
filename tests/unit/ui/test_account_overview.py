@@ -10,13 +10,23 @@ from compass.services.instrument_classification import classify_instrument
 from compass.services.local_signal_center import (
     SignalAccountValuationPoint,
     SignalInstrumentChoice,
+    SignalShadowExecution,
+    SignalShadowPoint,
+    SignalShadowSimulation,
 )
 from compass.storage.account_repository import StoredAccountSnapshot
 from compass.storage.signal_account_repository import SignalAccountProfile
+from compass.storage.signal_account_repository import (
+    ShadowExecutionTiming,
+    SignalShadowSimulationSetting,
+)
 from compass.ui.pages.account_overview import (
     AccountOverviewPageModel,
     _fund_chart_options,
     _latest_marked_snapshot,
+    _shadow_chart_options,
+    _shadow_progress,
+    _shadow_return,
 )
 
 
@@ -80,6 +90,40 @@ class Gateway:
             )
             for item in self.snapshots
         )
+
+    def enable_shadow_simulation(
+        self,
+        execution_timing,
+        *,
+        commission_rate,
+        minimum_commission,
+        slippage_bps,
+    ):  # type: ignore[no-untyped-def]
+        setting = SignalShadowSimulationSetting(
+            self.snapshots[-1].row_id,
+            execution_timing,
+            commission_rate,
+            minimum_commission,
+            slippage_bps,
+        )
+        self.profile = SignalAccountProfile(
+            self.profile.account_id,
+            self.profile.name,
+            holdings_account_id=self.profile.holdings_account_id,
+            shadow_simulation=setting,
+        )
+        return self.profile
+
+    def disable_shadow_simulation(self):  # type: ignore[no-untyped-def]
+        self.profile = SignalAccountProfile(
+            self.profile.account_id,
+            self.profile.name,
+            holdings_account_id=self.profile.holdings_account_id,
+        )
+        return self.profile
+
+    def shadow_simulation(self):  # type: ignore[no-untyped-def]
+        return None
 
     def compact_account_history(self):  # type: ignore[no-untyped-def]
         self.compacted = True
@@ -165,3 +209,65 @@ def test_account_overview_manages_accounts_and_snapshot_history() -> None:
     assert gateway.deleted == "main"
     assert model.compact_account_history() == 1
     assert gateway.compacted is True
+
+
+def test_account_overview_configures_shadow_simulation_from_current_snapshot() -> None:
+    gateway = Gateway()
+    model = AccountOverviewPageModel(gateway)
+
+    profile = model.enable_shadow_simulation("next_open", "0.0003", "5", 2)
+
+    assert profile.shadow_simulation == SignalShadowSimulationSetting(
+        2,
+        ShadowExecutionTiming.NEXT_OPEN,
+        Decimal("0.0003"),
+        Decimal("5"),
+        2,
+    )
+    assert model.disable_shadow_simulation().shadow_simulation is None
+
+
+def test_shadow_observation_presents_normalized_returns_and_progress() -> None:
+    simulation = SignalShadowSimulation(
+        SignalShadowSimulationSetting(2),
+        date(2026, 8, 11),
+        (
+            SignalShadowPoint(
+                date(2026, 8, 11),
+                Decimal("10000.00"),
+                Decimal("10000.00"),
+                Decimal("10000.00"),
+            ),
+            SignalShadowPoint(
+                date(2026, 8, 12),
+                Decimal("10100.00"),
+                Decimal("10200.00"),
+                Decimal("10050.00"),
+            ),
+        ),
+        (
+            SignalShadowExecution(
+                "decision-1",
+                date(2026, 8, 11),
+                None,
+                "pending",
+                0,
+                Decimal("0.00"),
+            ),
+        ),
+        (),
+    )
+
+    options = _shadow_chart_options(simulation)
+    series = options["series"]
+    assert isinstance(series, list)
+    assert series[0]["data"] == [0.0, 1.0]
+    assert series[1]["data"] == [0.0, 2.0]
+    assert series[2]["data"] == [0.0, 0.5]
+    assert _shadow_return(Decimal("10200"), Decimal("10000")) == Decimal("2.00")
+    assert _shadow_progress(simulation) == (
+        ("建立起点", True, False),
+        ("生成信号", True, False),
+        ("等待行情", False, True),
+        ("模拟成交", False, False),
+    )

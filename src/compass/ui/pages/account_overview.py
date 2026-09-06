@@ -21,9 +21,11 @@ from compass.services.local_signal_center import (
     SignalAccountValuationPoint,
     SignalDecisionFreshness,
     SignalInstrumentChoice,
+    SignalShadowSimulation,
 )
 from compass.storage.account_repository import StoredAccountSnapshot
 from compass.storage.signal_account_repository import SignalAccountProfile
+from compass.storage.signal_account_repository import ShadowExecutionTiming
 from compass.storage.signal_execution_repository import (
     SignalExecutionRecord,
     SignalExecutionStatus,
@@ -55,6 +57,16 @@ class AccountOverviewGateway(Protocol):
     def latest_account(self) -> StoredAccountSnapshot | None: ...
     def account_history(self) -> tuple[StoredAccountSnapshot, ...]: ...
     def account_valuation_history(self) -> tuple[SignalAccountValuationPoint, ...]: ...
+    def enable_shadow_simulation(
+        self,
+        execution_timing: ShadowExecutionTiming,
+        *,
+        commission_rate: Decimal,
+        minimum_commission: Decimal,
+        slippage_bps: int,
+    ) -> SignalAccountProfile: ...
+    def disable_shadow_simulation(self) -> SignalAccountProfile: ...
+    def shadow_simulation(self) -> SignalShadowSimulation | None: ...
     def compact_account_history(self) -> int: ...
     def save_account(
         self, cash: object, positions: Sequence[AccountPositionInput]
@@ -86,6 +98,8 @@ class AccountOverviewState:
     history: tuple[StoredAccountSnapshot, ...]
     valuations: tuple[SignalAccountValuationPoint, ...]
     decisions: tuple[AccountDecisionAudit, ...]
+    shadow: SignalShadowSimulation | None
+    shadow_error: str | None
 
 
 def _adoption_impact(
@@ -151,6 +165,43 @@ class AccountOverviewPageModel:
     def compact_account_history(self) -> int:
         return self._gateway.compact_account_history()
 
+    def enable_shadow_simulation(
+        self,
+        execution_timing: object,
+        commission_rate: object,
+        minimum_commission: object,
+        slippage_bps: object,
+    ) -> SignalAccountProfile:
+        try:
+            if type(execution_timing) is not str:
+                raise ValueError
+            timing = ShadowExecutionTiming(execution_timing)
+            rate = Decimal(str(commission_rate))
+            minimum = Decimal(str(minimum_commission))
+            if type(slippage_bps) is int:
+                slip = slippage_bps
+            elif type(slippage_bps) is float and slippage_bps.is_integer():
+                slip = int(slippage_bps)
+            elif (
+                type(slippage_bps) is str
+                and slippage_bps.isascii()
+                and slippage_bps.isdigit()
+            ):
+                slip = int(slippage_bps)
+            else:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ValueError("SIGNAL_SHADOW_CONFIGURATION_INVALID") from None
+        return self._gateway.enable_shadow_simulation(
+            timing,
+            commission_rate=rate,
+            minimum_commission=minimum,
+            slippage_bps=slip,
+        )
+
+    def disable_shadow_simulation(self) -> SignalAccountProfile:
+        return self._gateway.disable_shadow_simulation()
+
     def save_account(
         self,
         cash: object,
@@ -190,6 +241,12 @@ class AccountOverviewPageModel:
                     _adoption_impact(record, prices),
                 )
             )
+        shadow_error = None
+        try:
+            shadow = self._gateway.shadow_simulation()
+        except LookupError as error:
+            shadow = None
+            shadow_error = str(error)
         return AccountOverviewState(
             tuple(self._gateway.account_profiles()),
             self._gateway.active_account_profile(),
@@ -198,6 +255,8 @@ class AccountOverviewPageModel:
             tuple(self._gateway.account_history()),
             tuple(self._gateway.account_valuation_history()),
             tuple(audits),
+            shadow,
+            shadow_error,
         )
 
 
@@ -393,6 +452,85 @@ def _category_chart_options(
             }
         ],
     }
+
+
+def _shadow_chart_options(simulation: SignalShadowSimulation) -> dict[str, object]:
+    points = simulation.points
+    categories = [item.day.isoformat() for item in points]
+
+    def normalized(values: Sequence[Decimal]) -> list[float]:
+        if not values or values[0] == 0:
+            return [0.0 for _ in values]
+        baseline = values[0]
+        return [float((value / baseline - 1) * 100) for value in values]
+
+    return {
+        "animation": False,
+        "tooltip": {"trigger": "axis"},
+        "legend": {
+            "data": ["实际账户", "自动采用建议", "保持原持仓"],
+            "top": 8,
+        },
+        "grid": {"left": 72, "right": 32, "top": 56, "bottom": 72},
+        "xAxis": {
+            "type": "category",
+            "data": categories,
+            "axisLabel": {"rotate": 25},
+        },
+        "yAxis": {
+            "type": "value",
+            "name": "累计收益",
+            "axisLabel": {"formatter": "{value}%"},
+            "scale": True,
+        },
+        "dataZoom": (
+            {"type": "inside", "start": 0, "end": 100},
+            {"type": "slider", "bottom": 12, "start": 0, "end": 100},
+        ),
+        "series": [
+            {
+                "name": "实际账户",
+                "type": "line",
+                "showSymbol": False,
+                "lineStyle": {"width": 2, "color": "#2563eb"},
+                "data": normalized([item.actual_equity for item in points]),
+            },
+            {
+                "name": "自动采用建议",
+                "type": "line",
+                "showSymbol": False,
+                "lineStyle": {"width": 2, "color": "#dc2626"},
+                "data": normalized([item.shadow_equity for item in points]),
+            },
+            {
+                "name": "保持原持仓",
+                "type": "line",
+                "showSymbol": False,
+                "lineStyle": {"width": 2, "type": "dashed", "color": "#64748b"},
+                "data": normalized([item.hold_equity for item in points]),
+            },
+        ],
+    }
+
+
+def _shadow_return(current: Decimal, baseline: Decimal) -> Decimal | None:
+    if baseline == 0:
+        return None
+    return ((current / baseline - 1) * 100).quantize(Decimal("0.01"))
+
+
+def _shadow_progress(
+    simulation: SignalShadowSimulation,
+) -> tuple[tuple[str, bool, bool], ...]:
+    has_signal = bool(simulation.executions)
+    is_waiting = any(item.status == "pending" for item in simulation.executions)
+    has_result = any(item.status != "pending" for item in simulation.executions)
+    return (
+        ("建立起点", True, False),
+        ("生成信号", has_signal, not has_signal),
+        ("等待行情", has_signal and not is_waiting, is_waiting),
+        ("模拟成交", has_result, has_signal and not is_waiting and not has_result),
+    )
 
 
 def _latest_marked_snapshot(
@@ -837,6 +975,278 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
             ).classes("w-full h-96")
         else:
             ui.label("暂无可用于账户盯市的行情数据。").classes("text-sm text-grey-6")
+
+    shadow_setting = state.active_profile.shadow_simulation
+    with ui.card().classes("w-full"):
+        with ui.row().classes("w-full items-start justify-between gap-3"):
+            with ui.column().classes("gap-0"):
+                with ui.row().classes("items-center gap-2"):
+                    ui.label("策略观察").classes("text-subtitle1 font-semibold")
+                    if shadow_setting is not None:
+                        ui.badge("观察中", color="positive")
+                ui.label(
+                    "自动模拟采用新信号后的账户变化，并与实际账户、保持原持仓对比。"
+                ).classes("text-sm text-grey-7")
+
+        with ui.dialog() as shadow_settings_dialog, ui.card().classes(
+            "w-[620px] max-w-[95vw]"
+        ):
+            ui.label("策略观察 · 高级设置").classes("text-subtitle1 font-semibold")
+            ui.label(
+                "修改参数后会以当前持仓重新建立观察起点，原观察区间不再展示。"
+            ).classes("text-sm text-grey-7")
+            shadow_timing = ui.select(
+                {
+                    ShadowExecutionTiming.NEXT_OPEN.value: "下一交易日开盘（推荐）",
+                    ShadowExecutionTiming.DECISION_CLOSE.value: "信号日收盘（理论对照）",
+                },
+                value=(
+                    ShadowExecutionTiming.NEXT_OPEN.value
+                    if shadow_setting is None
+                    else shadow_setting.execution_timing.value
+                ),
+                label="模拟成交时机",
+            ).props("outlined dense options-dense").classes("w-full")
+            with ui.row().classes("w-full gap-3"):
+                shadow_rate = ui.input(
+                    "佣金率",
+                    value=(
+                        "0.0003"
+                        if shadow_setting is None
+                        else str(shadow_setting.commission_rate)
+                    ),
+                ).props("outlined dense").classes("grow")
+                shadow_minimum = ui.input(
+                    "最低佣金（元）",
+                    value=(
+                        "5"
+                        if shadow_setting is None
+                        else str(shadow_setting.minimum_commission)
+                    ),
+                ).props("outlined dense").classes("grow")
+                shadow_slippage = ui.number(
+                    "滑点（基点）",
+                    min=0,
+                    max=1000,
+                    step=1,
+                    value=(2 if shadow_setting is None else shadow_setting.slippage_bps),
+                ).props("outlined dense").classes("grow")
+            ui.label(
+                "信号日收盘仅用于理论复盘；日常前向观察建议使用下一交易日开盘。"
+            ).classes("text-xs text-orange-8")
+
+            def save_shadow_settings() -> None:
+                try:
+                    model.enable_shadow_simulation(
+                        shadow_timing.value,
+                        shadow_rate.value,
+                        shadow_minimum.value,
+                        shadow_slippage.value,
+                    )
+                except Exception as error:
+                    ui.notify(str(error)[:120] or "策略观察配置失败", type="negative")
+                    return
+                shadow_settings_dialog.close()
+                ui.notify("设置已保存，已从当前持仓重新开始观察。", type="positive")
+                ui.navigate.reload()
+
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("取消", on_click=shadow_settings_dialog.close).props("flat")
+                ui.button("保存并重新开始", on_click=save_shadow_settings)
+
+        def start_shadow() -> None:
+            try:
+                model.enable_shadow_simulation(
+                    ShadowExecutionTiming.NEXT_OPEN.value,
+                    "0.0003",
+                    "5",
+                    2,
+                )
+            except Exception as error:
+                ui.notify(str(error)[:120] or "策略观察开启失败", type="negative")
+                return
+            ui.notify("已从当前持仓开始观察。", type="positive")
+            ui.navigate.reload()
+
+        def disable_shadow() -> None:
+            try:
+                model.disable_shadow_simulation()
+            except Exception as error:
+                ui.notify(str(error)[:120] or "策略观察停止失败", type="negative")
+                return
+            ui.notify("策略观察已停止，真实账户未受影响。", type="positive")
+            ui.navigate.reload()
+
+        with ui.dialog() as restart_dialog, ui.card():
+            ui.label("重新开始策略观察？").classes("font-semibold")
+            ui.label("将以当前真实持仓建立新起点，原观察区间不再展示。").classes(
+                "text-sm text-grey-7"
+            )
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("取消", on_click=restart_dialog.close).props("flat")
+                ui.button("确认重新开始", on_click=start_shadow)
+
+        if shadow_setting is None:
+            with ui.column().classes("w-full items-center gap-3 py-5"):
+                ui.icon("monitoring", size="48px", color="primary")
+                ui.label("先建立一个观察起点，之后每次生成信号都会自动加入对照。")
+                with ui.row().classes("gap-2"):
+                    ui.button(
+                        "从当前持仓开始观察",
+                        icon="play_arrow",
+                        on_click=start_shadow,
+                    )
+                    ui.button(
+                        "高级设置",
+                        icon="tune",
+                        on_click=shadow_settings_dialog.open,
+                    ).props("flat color=grey")
+                ui.label("仅做模拟计算，不修改真实持仓，也不会发送真实委托。").classes(
+                    "text-xs text-grey-6"
+                )
+        else:
+            shadow = state.shadow
+            with ui.row().classes("w-full items-center justify-between gap-3 flex-wrap mt-2"):
+                if shadow is not None:
+                    with ui.row().classes("items-center gap-2 flex-wrap"):
+                        for label, done, active in _shadow_progress(shadow):
+                            icon = (
+                                "check_circle"
+                                if done
+                                else "schedule"
+                                if active
+                                else "radio_button_unchecked"
+                            )
+                            color = "positive" if done else "primary" if active else "grey"
+                            ui.chip(label, icon=icon, color=color).props("outline dense")
+                with ui.row().classes("gap-1"):
+                    ui.button(
+                        "高级设置",
+                        icon="tune",
+                        on_click=shadow_settings_dialog.open,
+                    ).props("flat dense")
+                    ui.button(
+                        "重新开始",
+                        icon="restart_alt",
+                        on_click=restart_dialog.open,
+                    ).props("flat dense")
+                    ui.button(
+                        "停止观察",
+                        icon="stop_circle",
+                        on_click=disable_shadow,
+                    ).props("flat dense color=grey")
+
+            if state.shadow_error is not None:
+                ui.label(f"观察结果暂不可用：{state.shadow_error}").classes(
+                    "text-sm text-negative"
+                )
+            elif shadow is not None:
+                if not shadow.executions:
+                    with ui.row().classes(
+                        "w-full items-center justify-between rounded-lg bg-blue-50 p-3 mt-2"
+                    ):
+                        ui.label("起点已建立，下一步生成一份今日信号。")
+                        ui.button(
+                            "去生成今日信号",
+                            icon="arrow_forward",
+                            on_click=lambda: ui.navigate.to("/signals"),
+                        ).props("flat")
+                elif any(item.status == "pending" for item in shadow.executions):
+                    with ui.row().classes(
+                        "w-full items-center justify-between rounded-lg bg-orange-50 p-3 mt-2"
+                    ):
+                        ui.label("已有信号，正在等待下一交易日行情后模拟成交。")
+                        ui.button(
+                            "去同步行情",
+                            icon="sync",
+                            on_click=lambda: ui.navigate.to("/data"),
+                        ).props("flat")
+                else:
+                    ui.label("已按最新本地行情完成模拟计算。").classes(
+                        "text-sm text-positive mt-2"
+                    )
+                if shadow.unavailable_instruments:
+                    ui.label(
+                        "以下标的缺少当前行情，相关信号无法模拟成交："
+                        + "、".join(str(item) for item in shadow.unavailable_instruments)
+                    ).classes("text-xs text-orange-8")
+                if shadow.points:
+                    first_shadow = shadow.points[0]
+                    last_shadow = shadow.points[-1]
+                    shadow_return = _shadow_return(
+                        last_shadow.shadow_equity, first_shadow.shadow_equity
+                    )
+                    hold_return = _shadow_return(
+                        last_shadow.hold_equity, first_shadow.hold_equity
+                    )
+                    total_costs = sum(
+                        (item.costs for item in shadow.executions), Decimal("0")
+                    )
+                    with ui.row().classes("w-full gap-3 mt-2"):
+                        for label, value in (
+                            (
+                                "自动采用收益",
+                                "—" if shadow_return is None else f"{shadow_return:+.2f}%",
+                            ),
+                            (
+                                "保持原持仓收益",
+                                "—" if hold_return is None else f"{hold_return:+.2f}%",
+                            ),
+                            (
+                                "相对原持仓",
+                                "—"
+                                if shadow_return is None or hold_return is None
+                                else f"{shadow_return - hold_return:+.2f}%",
+                            ),
+                            ("模拟费用", f"¥{total_costs:,.2f}"),
+                            ("观察起点", shadow.start_day.isoformat()),
+                        ):
+                            with ui.card().classes(
+                                "min-w-40 border border-slate-200 shadow-none"
+                            ):
+                                ui.label(label).classes("text-xs text-grey-6")
+                                ui.label(value).classes("text-base font-semibold")
+                    if first_shadow.day == last_shadow.day:
+                        ui.label("目前只有起点数据；生成信号并同步后续行情后曲线会自动延长。")
+                    ui.echart(_shadow_chart_options(shadow)).classes("w-full h-96")
+                status_labels = {
+                    "executed": "已模拟成交",
+                    "no_trade": "无需调仓",
+                    "pending": "等待下一交易日行情",
+                    "unfilled": "未能成交",
+                }
+                if shadow.executions:
+                    with ui.expansion(
+                        f"查看模拟明细（{len(shadow.executions)} 条）",
+                        icon="receipt_long",
+                    ).classes("w-full"):
+                        ui.table(
+                            columns=[
+                                {"name": "signal", "label": "信号日", "field": "signal"},
+                                {"name": "execution", "label": "模拟成交日", "field": "execution"},
+                                {"name": "status", "label": "状态", "field": "status"},
+                                {"name": "trades", "label": "成交标的", "field": "trades", "align": "right"},
+                                {"name": "costs", "label": "费用", "field": "costs", "align": "right"},
+                                {"name": "id", "label": "决策 ID", "field": "id"},
+                            ],
+                            rows=[
+                                {
+                                    "signal": item.signal_day.isoformat(),
+                                    "execution": (
+                                        "—"
+                                        if item.execution_day is None
+                                        else item.execution_day.isoformat()
+                                    ),
+                                    "status": status_labels[item.status],
+                                    "trades": item.trade_count,
+                                    "costs": f"¥{item.costs:,.2f}",
+                                    "id": item.decision_id,
+                                }
+                                for item in reversed(shadow.executions)
+                            ],
+                            row_key="id",
+                            pagination=5,
+                        ).classes("w-full").props("flat bordered dense")
 
     with ui.card().classes("w-full"):
         ui.label("当前持仓结构").classes("text-subtitle1 font-semibold")

@@ -26,6 +26,7 @@ from compass.services.local_signal_center import SignalExecutionFillInput
 from compass.services.task_manager import TaskOperationError, TaskStatus
 from compass.storage.models import DatasetBundleRecord, DatasetManifestRecord
 from compass.storage.signal_execution_repository import SignalExecutionStatus
+from compass.storage.signal_account_repository import ShadowExecutionTiming
 from compass.strategies.base import StrategyFrequency
 from compass.strategies.rule_dsl import DslVariable
 from compass.ui.pages.data import DataSyncRange
@@ -975,11 +976,20 @@ def test_signal_decision_comparison_and_cleanup_use_the_frozen_account(
             "100000.00",
             (AccountPositionInput(str(FIRST), 500, 500, "4.00"),),
         )
+        application.signal_center.enable_shadow_simulation(
+            ShadowExecutionTiming.NEXT_OPEN,
+            commission_rate=Decimal("0.0003"),
+            minimum_commission=Decimal("5"),
+            slippage_bps=2,
+        )
         decision = application.signal_center.generate(
             (SelectedDecisionStrategy(strategy.instance_id, Decimal("0.60")),),
             cash_reserve=Decimal("0.20"),
             minimum_trade_amount=Decimal("2000"),
         )
+        pending_simulation = application.signal_center.shadow_simulation()
+        assert pending_simulation is not None
+        assert pending_simulation.executions[-1].status == "pending"
         application.signal_center.record_execution(
             decision.decision_id,
             SignalExecutionStatus.IGNORED,
@@ -990,6 +1000,7 @@ def test_signal_decision_comparison_and_cleanup_use_the_frozen_account(
         application.data_gateway.sync("akshare", date(2026, 8, 10), date(2026, 8, 11))
 
         comparison = application.signal_center.compare_decision(decision.decision_id)
+        simulation = application.signal_center.shadow_simulation()
 
         assert comparison.decision_id == decision.decision_id
         assert comparison.points[0].day == decision.result.decision_date
@@ -998,6 +1009,12 @@ def test_signal_decision_comparison_and_cleanup_use_the_frozen_account(
         assert comparison.adopted_return == (
             comparison.points[-1].adopted_equity / decision.result.decision_equity - 1
         ).quantize(Decimal("0.0001"))
+        assert simulation is not None
+        assert simulation.start_day == date(2026, 8, 7)
+        assert simulation.points[-1].day == date(2026, 8, 11)
+        assert simulation.points[-1].shadow_equity != simulation.points[-1].hold_equity
+        assert simulation.executions[-1].status == "executed"
+        assert simulation.executions[-1].execution_day == date(2026, 8, 10)
 
         assert application.signal_center.delete_decision(decision.decision_id) is True
         assert application.signal_center.decision(decision.decision_id) is None

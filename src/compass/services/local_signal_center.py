@@ -4,7 +4,7 @@ from bisect import bisect_right
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
-from decimal import Decimal, DecimalException
+from decimal import ROUND_HALF_UP, Decimal, DecimalException
 from numbers import Number
 from types import MappingProxyType
 
@@ -25,9 +25,11 @@ from compass.storage.account_repository import (
 )
 from compass.storage.dataset_bundle_repository import DatasetBundleRepository
 from compass.storage.signal_account_repository import (
+    ShadowExecutionTiming,
     SignalAccountProfile,
     SignalAccountRepository,
     SignalAccountStrategySetting,
+    SignalShadowSimulationSetting,
 )
 from compass.storage.signal_execution_repository import (
     SignalExecutionFill,
@@ -136,6 +138,86 @@ class SignalAccountValuationPoint:
             "position_values",
             MappingProxyType(dict(sorted(values.items(), key=lambda item: str(item[0])))),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class SignalShadowPoint:
+    day: date
+    actual_equity: Decimal
+    shadow_equity: Decimal
+    hold_equity: Decimal
+
+    def __post_init__(self) -> None:
+        if type(self.day) is not date:
+            raise TypeError("shadow point day must be exact")
+        for value in (self.actual_equity, self.shadow_equity, self.hold_equity):
+            if (
+                type(value) is not Decimal
+                or not value.is_finite()
+                or value < 0
+                or value != value.quantize(Decimal("0.01"))
+            ):
+                raise ValueError("shadow point equity must be non-negative cents")
+
+
+@dataclass(frozen=True, slots=True)
+class SignalShadowExecution:
+    decision_id: str
+    signal_day: date
+    execution_day: date | None
+    status: str
+    trade_count: int
+    costs: Decimal
+
+    def __post_init__(self) -> None:
+        if type(self.decision_id) is not str or not self.decision_id:
+            raise ValueError("shadow decision id must be non-empty")
+        if type(self.signal_day) is not date:
+            raise TypeError("shadow signal day must be exact")
+        if self.execution_day is not None and type(self.execution_day) is not date:
+            raise TypeError("shadow execution day must be exact or None")
+        if self.status not in {"executed", "no_trade", "pending", "unfilled"}:
+            raise ValueError("shadow execution status is invalid")
+        if type(self.trade_count) is not int or self.trade_count < 0:
+            raise ValueError("shadow trade count must be non-negative")
+        if (
+            type(self.costs) is not Decimal
+            or not self.costs.is_finite()
+            or self.costs < 0
+            or self.costs != self.costs.quantize(Decimal("0.01"))
+        ):
+            raise ValueError("shadow costs must be non-negative cents")
+
+
+@dataclass(frozen=True, slots=True)
+class SignalShadowSimulation:
+    setting: SignalShadowSimulationSetting
+    start_day: date
+    points: tuple[SignalShadowPoint, ...]
+    executions: tuple[SignalShadowExecution, ...]
+    unavailable_instruments: tuple[InstrumentId, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.setting) is not SignalShadowSimulationSetting:
+            raise TypeError("shadow setting must be exact")
+        if type(self.start_day) is not date:
+            raise TypeError("shadow start day must be exact")
+        points = tuple(self.points)
+        executions = tuple(self.executions)
+        unavailable = tuple(self.unavailable_instruments)
+        if any(type(item) is not SignalShadowPoint for item in points):
+            raise TypeError("shadow points must be exact")
+        if tuple(item.day for item in points) != tuple(
+            sorted({item.day for item in points})
+        ):
+            raise ValueError("shadow point days must be unique and sorted")
+        if any(type(item) is not SignalShadowExecution for item in executions):
+            raise TypeError("shadow executions must be exact")
+        if unavailable != tuple(sorted(set(unavailable), key=str)):
+            raise ValueError("unavailable shadow instruments must be unique and sorted")
+        object.__setattr__(self, "points", points)
+        object.__setattr__(self, "executions", executions)
+        object.__setattr__(self, "unavailable_instruments", unavailable)
 
 
 def _decimal(value: object, *, label: str, cents: bool = False) -> Decimal:
@@ -411,6 +493,302 @@ class LocalSignalCenter:
                 )
             )
         return tuple(points)
+
+    def enable_shadow_simulation(
+        self,
+        execution_timing: ShadowExecutionTiming,
+        *,
+        commission_rate: Decimal,
+        minimum_commission: Decimal,
+        slippage_bps: int,
+    ) -> SignalAccountProfile:
+        latest = self._active_accounts().latest()
+        if latest is None:
+            raise LookupError("SIGNAL_SHADOW_ACCOUNT_MISSING")
+        setting = SignalShadowSimulationSetting(
+            latest.row_id,
+            execution_timing,
+            commission_rate,
+            minimum_commission,
+            slippage_bps,
+        )
+        return self._account_profiles.save_shadow_simulation(
+            self.active_account_profile().account_id,
+            setting,
+        )
+
+    def disable_shadow_simulation(self) -> SignalAccountProfile:
+        return self._account_profiles.save_shadow_simulation(
+            self.active_account_profile().account_id,
+            None,
+        )
+
+    def shadow_simulation(self) -> SignalShadowSimulation | None:
+        setting = self.active_account_profile().shadow_simulation
+        if setting is None:
+            return None
+        start = self._active_accounts().get(setting.start_snapshot_row_id)
+        if start is None:
+            raise LookupError("SIGNAL_SHADOW_START_MISSING")
+        bundle = self._bundles.latest()
+        if bundle is None:
+            raise LookupError("SIGNAL_SHADOW_MARKET_DATA_MISSING")
+        daily_decisions: dict[date, DecisionExportRecord] = {}
+        for record in sorted(
+            self.decision_history(),
+            key=lambda item: (item.result.decision_at, item.decision_id),
+        ):
+            if record.result.decision_date >= start.snapshot.as_of:
+                daily_decisions[record.result.decision_date] = record
+        decisions = tuple(daily_decisions.values())
+        required = {
+            position.instrument for position in start.snapshot.positions
+        } | {
+            recommendation.instrument
+            for record in decisions
+            for recommendation in record.result.recommendations
+        }
+        references = self._bundles.references_by_instrument(bundle)
+        unavailable = tuple(sorted(required - set(references), key=str))
+        selected = tuple(sorted(required & set(references), key=str))
+        if not selected:
+            selected = (bundle.instruments[0],)
+        opens: dict[InstrumentId, dict[date, Decimal]] = {}
+        closes: dict[InstrumentId, dict[date, Decimal]] = {}
+        close_days: dict[InstrumentId, tuple[date, ...]] = {}
+        market_days: set[date] = {start.snapshot.as_of}
+        for instrument in selected:
+            frame = self._bundles.read_manifest(references[instrument].manifest_id)
+            opens[instrument] = {
+                timestamp.date(): _decimal(row["open"], label="shadow open")
+                for timestamp, row in frame.iterrows()
+            }
+            closes[instrument] = {
+                timestamp.date(): _decimal(row["close"], label="shadow close")
+                for timestamp, row in frame.iterrows()
+            }
+            close_days[instrument] = tuple(closes[instrument])
+            market_days.update(
+                day for day in close_days[instrument] if day >= start.snapshot.as_of
+            )
+        days = tuple(sorted(market_days))
+        latest_market_day = days[-1]
+        fallback_prices = {
+            position.instrument: position.mark_price
+            for position in start.snapshot.positions
+        }
+
+        def close_at(instrument: InstrumentId, day: date) -> Decimal | None:
+            instrument_days = close_days.get(instrument)
+            if instrument_days:
+                index = bisect_right(instrument_days, day) - 1
+                if index >= 0:
+                    return closes[instrument][instrument_days[index]]
+            return fallback_prices.get(instrument)
+
+        scheduled: dict[date, list[DecisionExportRecord]] = {}
+        execution_rows: list[SignalShadowExecution] = []
+        for record in decisions:
+            actionable = tuple(
+                item
+                for item in record.result.recommendations
+                if not item.blocked and item.quantity_delta != 0
+            )
+            if not actionable:
+                execution_rows.append(
+                    SignalShadowExecution(
+                        record.decision_id,
+                        record.result.decision_date,
+                        record.result.decision_date,
+                        "no_trade",
+                        0,
+                        Decimal("0.00"),
+                    )
+                )
+                continue
+            candidates: tuple[date, ...]
+            if setting.execution_timing is ShadowExecutionTiming.DECISION_CLOSE:
+                candidates = (record.result.decision_date,)
+                price_rows = closes
+            else:
+                candidates = tuple(
+                    day
+                    for day in days
+                    if record.result.decision_date < day <= record.result.valid_until
+                )
+                price_rows = opens
+            execution_day = next(
+                (
+                    day
+                    for day in candidates
+                    if all(day in price_rows.get(item.instrument, {}) for item in actionable)
+                ),
+                None,
+            )
+            if execution_day is None:
+                pending = latest_market_day < record.result.valid_until
+                execution_rows.append(
+                    SignalShadowExecution(
+                        record.decision_id,
+                        record.result.decision_date,
+                        None,
+                        "pending" if pending else "unfilled",
+                        0,
+                        Decimal("0.00"),
+                    )
+                )
+                continue
+            scheduled.setdefault(execution_day, []).append(record)
+
+        shadow_cash = start.snapshot.cash
+        shadow_quantities = {
+            position.instrument: position.quantity
+            for position in start.snapshot.positions
+        }
+        hold_cash = start.snapshot.cash
+        hold_quantities = dict(shadow_quantities)
+        actual = tuple(
+            item
+            for item in self.account_valuation_history()
+            if item.day >= start.snapshot.as_of
+        )
+        actual_days = tuple(item.day for item in actual)
+
+        def marked_equity(
+            cash: Decimal,
+            quantities: Mapping[InstrumentId, int],
+            day: date,
+        ) -> Decimal:
+            total = cash
+            for instrument, quantity in quantities.items():
+                price = close_at(instrument, day)
+                if price is not None:
+                    total += price * quantity
+            return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        def costs(gross: Decimal) -> Decimal:
+            if gross <= 0:
+                return Decimal("0.00")
+            return max(
+                setting.minimum_commission,
+                gross * setting.commission_rate,
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        points: list[SignalShadowPoint] = []
+        for day in days:
+            for record in scheduled.get(day, ()):
+                recommendations = tuple(
+                    item
+                    for item in record.result.recommendations
+                    if not item.blocked and item.quantity_delta != 0
+                )
+                base_equity = marked_equity(
+                    shadow_cash,
+                    shadow_quantities,
+                    record.result.decision_date,
+                )
+                price_rows = (
+                    closes
+                    if setting.execution_timing is ShadowExecutionTiming.DECISION_CLOSE
+                    else opens
+                )
+                execution_prices: dict[InstrumentId, Decimal] = {}
+                targets: dict[InstrumentId, int] = {}
+                for item in recommendations:
+                    raw_price = price_rows[item.instrument][day]
+                    provisional_target = int(
+                        item.final_weight * base_equity / raw_price / 100
+                    ) * 100
+                    current_quantity = shadow_quantities.get(item.instrument, 0)
+                    slip = Decimal(setting.slippage_bps) / Decimal("10000")
+                    multiplier = Decimal("1") + (
+                        slip if provisional_target > current_quantity else -slip
+                    )
+                    price = (raw_price * multiplier).quantize(
+                        Decimal("0.0001"), rounding=ROUND_HALF_UP
+                    )
+                    execution_prices[item.instrument] = price
+                    targets[item.instrument] = int(
+                        item.final_weight * base_equity / price / 100
+                    ) * 100
+                trade_count = 0
+                total_costs = Decimal("0.00")
+                for item in recommendations:
+                    instrument = item.instrument
+                    current_quantity = shadow_quantities.get(instrument, 0)
+                    target = targets[instrument]
+                    if target >= current_quantity:
+                        continue
+                    quantity = current_quantity - target
+                    gross = execution_prices[instrument] * quantity
+                    fee = costs(gross)
+                    shadow_cash += gross - fee
+                    total_costs += fee
+                    trade_count += 1
+                    if target:
+                        shadow_quantities[instrument] = target
+                    else:
+                        shadow_quantities.pop(instrument, None)
+                    fallback_prices[instrument] = execution_prices[instrument]
+                for item in recommendations:
+                    instrument = item.instrument
+                    current_quantity = shadow_quantities.get(instrument, 0)
+                    desired = max(0, targets[instrument] - current_quantity)
+                    if desired <= 0:
+                        continue
+                    price = execution_prices[instrument]
+                    quantity = min(desired, int(shadow_cash / price / 100) * 100)
+                    while quantity > 0:
+                        gross = price * quantity
+                        fee = costs(gross)
+                        if gross + fee <= shadow_cash:
+                            break
+                        quantity -= 100
+                    if quantity <= 0:
+                        continue
+                    gross = price * quantity
+                    fee = costs(gross)
+                    shadow_cash -= gross + fee
+                    total_costs += fee
+                    trade_count += 1
+                    shadow_quantities[instrument] = current_quantity + quantity
+                    fallback_prices[instrument] = price
+                execution_rows.append(
+                    SignalShadowExecution(
+                        record.decision_id,
+                        record.result.decision_date,
+                        day,
+                        "executed" if trade_count else "no_trade",
+                        trade_count,
+                        total_costs,
+                    )
+                )
+            actual_index = bisect_right(actual_days, day) - 1
+            actual_equity = (
+                start.snapshot.equity
+                if actual_index < 0
+                else actual[actual_index].equity
+            )
+            points.append(
+                SignalShadowPoint(
+                    day,
+                    actual_equity,
+                    marked_equity(shadow_cash, shadow_quantities, day),
+                    marked_equity(hold_cash, hold_quantities, day),
+                )
+            )
+        return SignalShadowSimulation(
+            setting,
+            start.snapshot.as_of,
+            tuple(points),
+            tuple(
+                sorted(
+                    execution_rows,
+                    key=lambda item: (item.signal_day, item.decision_id),
+                )
+            ),
+            unavailable,
+        )
 
     def compact_account_history(self) -> int:
         protected = self._decisions.referenced_account_snapshot_ids().union(
