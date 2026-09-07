@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Callable
+from datetime import date
 
 from nicegui import ui
+from compass.ui.pages.watchlists import WatchlistPageModel
+from compass.ui.pages.signals import SignalPageModel
+from compass.services.task_manager import TaskManager, TaskStatus
+from compass.ui.task_status import task_status_label
+from compass.ui.navigation import account_url
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +93,15 @@ def _entry_card(entry: StartPageEntry) -> None:
                     ui.label(entry.description).classes("text-sm text-slate-600")
 
 
-def render_start_page() -> None:
+def render_start_page(
+    watchlists: WatchlistPageModel | None = None,
+    signals: SignalPageModel | None = None,
+    tasks: TaskManager | None = None,
+    latest_session: Callable[[], date] | None = None,
+) -> None:
+    if watchlists is not None and signals is not None:
+        render_workbench(watchlists, signals, tasks, latest_session)
+        return
     with ui.card().classes(
         "w-full border-0 shadow-none bg-gradient-to-r from-emerald-50 to-slate-50"
     ):
@@ -94,6 +109,7 @@ def render_start_page() -> None:
         ui.label(
             "日常使用建议先同步行情，再查看今日信号；需要研究策略时进入策略实验室或策略回测。"
         ).classes("text-sm text-slate-600")
+
         with ui.row().classes("gap-3"):
             ui.button(
                 "查看今日信号",
@@ -123,3 +139,88 @@ def render_start_page() -> None:
             "③ 策略实验室创建或调优策略  →  ④ 策略回测验证  →  "
             "⑤ 账户维护持仓  →  ⑥ 今日信号生成建议"
         ).classes("text-sm text-slate-600")
+
+
+def render_workbench(
+    watchlists: WatchlistPageModel,
+    signals: SignalPageModel,
+    tasks: TaskManager | None,
+    latest_session: Callable[[], date] | None,
+) -> None:
+    @ui.refreshable
+    def status() -> None:
+        try:
+            pool = watchlists.state().entry
+            state = signals.state()
+        except Exception:
+            ui.label("工作台状态暂不可用，请到日志查看原因。").classes("text-red-700")
+            ui.button("查看日志", on_click=lambda: ui.navigate.to("/logs"))
+            return
+        data_day = min((item.data_day for item in state.instruments), default=None)
+        try:
+            expected = latest_session() if latest_session else None
+        except Exception:
+            expected = None
+        needed = set(pool.instruments) if pool else set()
+        available = {item.instrument for item in state.instruments}
+        data_ready = bool(needed) and needed <= available and (
+            expected is not None and data_day is not None and data_day >= expected
+        )
+        account_id = state.active_account_profile.account_id
+        steps = (
+            ("添加关注标的", bool(pool and pool.enabled), "/watchlists"),
+            ("同步完整行情", data_ready, "/data"),
+            ("创建并启用策略", bool(state.strategies), "/strategies"),
+            ("保存账户持仓", state.account is not None, account_url("/account", account_id)),
+        )
+        next_step = next((item for item in steps if not item[1]), (
+            "查看并生成今日建议", False, account_url("/signals", account_id)
+        ))
+        with ui.card().classes("w-full bg-emerald-50 shadow-none border border-emerald-100"):
+            ui.label(f"{state.active_account_profile.name} · 工作台").classes("text-xl font-semibold")
+            ui.label(
+                "准备已完成，可以生成今日建议。" if all(item[1] for item in steps)
+                else f"下一步：{next_step[0]}"
+            ).classes("text-sm text-slate-600")
+            ui.button(next_step[0], icon="arrow_forward", on_click=lambda: ui.navigate.to(next_step[2]))
+        with ui.grid(columns=3).classes("w-full gap-4 max-md:grid-cols-1"):
+            pending = sum(
+                signals.execution(item.decision_id) is None
+                and not signals.decision_freshness(item).stale
+                and item.result.valid_until >= date.today()
+                for item in state.decision_history
+            )
+            for label, value, detail in (
+                ("本地行情", data_day.isoformat() if data_day else "尚未同步",
+                 f"完整交易日：{expected}" if expected else "交易日历尚不可用，请先同步行情"),
+                ("账户资产（持仓快照）",
+                 f"¥{state.account.snapshot.equity:,.2f}" if state.account else "尚未配置",
+                 f"快照日期：{state.account.snapshot.as_of}" if state.account else "可先保存纯现金账户"),
+                ("待处理建议", str(pending), "仅统计仍有效且未记录执行的建议"),
+            ):
+                with ui.card().classes("w-full border border-slate-200 shadow-none"):
+                    ui.label(label).classes("text-sm text-slate-500")
+                    ui.label(value).classes("text-xl font-semibold")
+                    ui.label(detail).classes("text-xs text-slate-500")
+        with ui.card().classes("w-full shadow-none border border-slate-200"):
+            ui.label("使用准备").classes("font-semibold")
+            for label, ready, route in steps:
+                with ui.row().classes("w-full items-center justify-between"):
+                    with ui.row().classes("items-center gap-2"):
+                        ui.icon("check_circle" if ready else "radio_button_unchecked",
+                                color="positive" if ready else "grey")
+                        ui.label(label)
+                    ui.button("查看" if ready else "去完成", on_click=lambda target=route: ui.navigate.to(target)).props("flat")
+        if tasks is not None:
+            with ui.card().classes("w-full shadow-none border border-slate-200"):
+                ui.label("最近任务").classes("font-semibold")
+                recent = sorted(tasks.snapshots(), key=lambda item: item.submitted_at, reverse=True)[:5]
+                if not recent:
+                    ui.label("本次启动还没有后台任务。").classes("text-sm text-slate-500")
+                for task in recent:
+                    ui.label(f"{task.name} · {task_status_label(task.status)}").classes(
+                        "text-red-700" if task.status is TaskStatus.FAILED else "text-sm"
+                    )
+                ui.link("查看行情同步历史", "/data")
+    status()
+    ui.timer(10.0, status.refresh)

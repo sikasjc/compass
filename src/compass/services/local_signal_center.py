@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections.abc import Callable, Mapping, Sequence
+from copy import copy
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal, DecimalException
@@ -292,12 +293,29 @@ class LocalSignalCenter:
         self._account_profiles = account_profiles
         self._executions = executions
         self._account_factory = account_factory
+        self._bound_account_id: str | None = None
+        self._expected_snapshot_id: int | None = -1
+
+    def for_account(self, account_id: str | None = None) -> LocalSignalCenter:
+        """Bind a page to an account without changing any other page's selection."""
+        scoped = copy(self)
+        scoped._bound_account_id = account_id or self.active_account_profile().account_id
+        scoped.active_account_profile()  # Reject unknown/deleted accounts, never fall back.
+        latest = scoped.latest_account()
+        scoped._expected_snapshot_id = None if latest is None else latest.row_id
+        return scoped
 
     def account_profiles(self) -> tuple[SignalAccountProfile, ...]:
         return self._account_profiles.state().profiles
 
     def active_account_profile(self) -> SignalAccountProfile:
-        return self._account_profiles.state().active
+        state = self._account_profiles.state()
+        if self._bound_account_id is None:
+            return state.active
+        for profile in state.profiles:
+            if profile.account_id == self._bound_account_id:
+                return profile
+        raise LookupError("账户已删除，请重新选择账户。")
 
     def select_account(self, account_id: str) -> SignalAccountProfile:
         return self._account_profiles.select(account_id).active
@@ -808,9 +826,18 @@ class LocalSignalCenter:
         rows = tuple(positions)
         if any(type(item) is not AccountPositionInput for item in rows):
             raise TypeError("positions must contain AccountPositionInput values")
-        if not choices:
+        if not choices and rows:
             raise LookupError("SIGNAL_MARKET_DATA_MISSING")
-        as_of = min(item.data_day for item in choices.values())
+        as_of = min(
+            (item.data_day for item in choices.values()),
+            default=datetime.now(SHANGHAI).date(),
+        )
+        # A cash-only snapshot may predate the first market sync. Saving today's
+        # holdings must not move behind an existing snapshot when prices are older.
+        as_of = max(
+            as_of,
+            max((item.snapshot.as_of for item in self._active_accounts().history()), default=as_of),
+        )
         parsed_positions: list[Position] = []
         seen: set[str] = set()
         for row in rows:
@@ -839,7 +866,12 @@ class LocalSignalCenter:
         snapshot = AccountSnapshot(as_of, parsed_cash, parsed_positions)
         if snapshot.equity == 0:
             raise ValueError("SIGNAL_ACCOUNT_EQUITY_REQUIRED")
-        return self._active_accounts().save(snapshot)
+        saved = self._active_accounts().save(
+            snapshot, expected_row_id=self._expected_snapshot_id
+        )
+        if self._bound_account_id is not None:
+            self._expected_snapshot_id = saved.row_id
+        return saved
 
     def generate(
         self,

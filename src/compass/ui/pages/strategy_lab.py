@@ -23,6 +23,11 @@ from compass.strategies.kronos_forecast import KronosForecastParameters, kronos_
 from compass.ui.components.charts import CurvePoint, equity_chart_options, thaw_chart_options
 from compass.ui.pages.backtests import BacktestReport
 from compass.ui.task_status import task_status_label
+from compass.services.research_workspace import (
+    ResearchWorkspace, SavedResearchConfiguration, configuration_from_report,
+)
+from compass.ui.edit_guard import EditGuard
+from urllib.parse import urlencode
 
 
 class StrategyLabKind(StrEnum):
@@ -343,7 +348,10 @@ class TaskGateway(Protocol):
 
 
 class StrategyLabPageModel:
-    def __init__(self, gateway: StrategyLabGateway, tasks: TaskGateway) -> None:
+    def __init__(
+        self, gateway: StrategyLabGateway, tasks: TaskGateway,
+        workspace: ResearchWorkspace | None = None,
+    ) -> None:
         self._gateway = gateway
         self._tasks = tasks
         self._active_run_id: str | None = None
@@ -354,6 +362,38 @@ class StrategyLabPageModel:
         self._history_page_size = 10
         self._history_query = ""
         self._lock = RLock()
+        self.workspace = workspace
+        running = [
+            task for task in self._task_snapshots()
+            if task.name.startswith("backtest:") and task.status not in _TERMINAL_STATUSES
+        ]
+        if running:
+            self._active_task = max(running, key=lambda task: task.submitted_at)
+            self._active_run_id = self._active_task.name.removeprefix("backtest:")
+
+    def saved_configurations(self) -> tuple[SavedResearchConfiguration, ...]:
+        return self.workspace.list() if self.workspace else ()
+
+    def save_configuration(
+        self, name: str, configuration: StrategyLabConfiguration, *, key: str | None = None
+    ) -> SavedResearchConfiguration:
+        if self.workspace is None:
+            raise ValueError("研究配置存储未配置。")
+        return self.workspace.save(name, configuration, key=key)
+
+    def report_configuration(self, run_id: str) -> StrategyLabConfiguration:
+        report = self._gateway.report(run_id)
+        if report is None:
+            raise LookupError("回测结果不存在。")
+        return configuration_from_report(report)
+
+    def comparison_reports(self, run_ids: Sequence[str]) -> tuple[BacktestReport, ...]:
+        if not 2 <= len(set(run_ids)) <= 5:
+            raise ValueError("请选择 2 至 5 个不同实验。")
+        reports = tuple(self._gateway.report(run_id) for run_id in run_ids)
+        if any(item is None for item in reports):
+            raise LookupError("部分回测结果已不存在，请刷新历史记录。")
+        return tuple(item for item in reports if item is not None)
 
     def start(self, configuration: StrategyLabConfiguration) -> TaskSnapshot:
         if type(configuration) is not StrategyLabConfiguration:
@@ -815,7 +855,10 @@ def _forecast_trace_rows(report: BacktestReport) -> list[dict[str, object]]:
     ]
 
 
-def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
+def render_strategy_lab_page(
+    model: StrategyLabPageModel | None, *, configuration_key: str | None = None,
+    source_run: str | None = None,
+) -> None:
     if model is None:
         ui.label("策略回测服务尚未配置。").classes("text-sm text-slate-600")
         return
@@ -829,6 +872,7 @@ def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
         ui.label("当前没有可用于回测的行情数据，请先在行情数据页完成同步。").classes(
             "text-amber-700"
         )
+        ui.button("前往同步行情", icon="sync", on_click=lambda: ui.navigate.to("/data"))
         return
 
     by_id = {str(item.instrument): item for item in initial_state.instruments}
@@ -837,6 +881,30 @@ def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
     )
     if not available_etfs:
         ui.label("当前没有已同步的 ETF 行情，请先在行情数据页完成同步。").classes("text-amber-700")
+        ui.button("添加 ETF 标的", icon="add", on_click=lambda: ui.navigate.to("/watchlists"))
+        ui.button("同步行情", icon="sync", on_click=lambda: ui.navigate.to("/data"))
+        return
+    guard = EditGuard()
+    restored: StrategyLabConfiguration | None = None
+    restored_name = "我的研究配置"
+    try:
+        if source_run:
+            restored = model.report_configuration(source_run)
+        elif configuration_key and model.workspace:
+            saved_configuration = model.workspace.get(configuration_key)
+            restored = saved_configuration.configuration
+            restored_name = saved_configuration.name
+        if restored is not None:
+            needed = {restored.benchmark} | {
+                item for leg in restored.strategies for item in leg.instruments
+            } | {leg.signal_instrument for leg in restored.strategies if leg.signal_instrument} | {
+                item.instrument for item in restored.initial_positions
+            }
+            if not needed <= {item.instrument for item in initial_state.instruments}:
+                raise ValueError("这份配置的部分标的缺少行情，请先补齐后再载入。")
+    except Exception as error:
+        ui.label(f"配置未载入：{error}").classes("text-red-700")
+        ui.link("同步行情", "/data")
         return
     trade_options = {
         str(item.instrument): item.label
@@ -852,7 +920,7 @@ def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
         ),
         str(initial_state.instruments[0].instrument),
     )
-    default_benchmark = default_signal
+    default_benchmark = str(restored.benchmark) if restored else default_signal
     common_start = max(item.first_day for item in initial_state.instruments)
     common_end = min(item.last_day for item in initial_state.instruments)
     if common_start >= common_end:
@@ -873,753 +941,856 @@ def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
     templates_by_id = {item.instance_id: item for item in initial_state.templates}
     active_template: dict[str, StrategyLabTemplate | None] = {"value": None}
 
-    ui.label("多个策略共享一个账户，各自给出 ETF 目标仓位，再按资金占比合并执行。").classes(
-        "text-sm text-slate-600"
-    )
-    with ui.card().classes("w-full border border-slate-200 shadow-none"):
-        ui.label("账户与成交设置").classes("text-lg font-semibold")
-        with ui.row().classes("w-full gap-4"):
-            start_input = ui.input("开始日期", value=common_start.isoformat()).props("type=date")
-            end_input = ui.input("结束日期", value=common_end.isoformat()).props("type=date")
-            cash_input = ui.number("初始资金（元）", value=1_000_000, min=10_000, step=10_000)
-            timing_select = ui.select(
+    with ui.tabs().classes("w-full") as sections:
+        configure_tab = ui.tab("配置回测")
+        result_tab = ui.tab("运行与结果")
+        history_tab = ui.tab("历史与对比")
+    with ui.tab_panels(sections, value=configure_tab).classes("w-full"):
+        configure_panel = ui.tab_panel(configure_tab).classes("p-0")
+        result_panel = ui.tab_panel(result_tab).classes("p-0")
+        history_container = ui.tab_panel(history_tab).classes("p-0")
+
+    with configure_panel:
+        with ui.card().classes("w-full border shadow-none"):
+            ui.label("保存与恢复研究配置").classes("font-semibold")
+            saved_options = {item.key: item.name for item in model.saved_configurations()}
+            saved_select = ui.select(
+                saved_options, label="已保存配置",
+                value=configuration_key if configuration_key in saved_options else None,
+            ).classes("w-full")
+            ui.button("载入配置", icon="folder_open", on_click=lambda: guard.navigate(
+                "/backtests?" + urlencode({"configuration_key": str(saved_select.value)})
+            )).props("outline").bind_enabled_from(saved_select, "value", backward=bool)
+            config_name = ui.input("配置名称", value=restored_name).classes("w-full")
+        ui.label("多个策略共享一个账户，各自给出 ETF 目标仓位，再按资金占比合并执行。").classes(
+            "text-sm text-slate-600"
+        )
+        with ui.card().classes("w-full border border-slate-200 shadow-none"):
+            ui.label("账户与成交设置").classes("text-lg font-semibold")
+            with ui.row().classes("w-full gap-4"):
+                start_input = ui.input("开始日期", value=common_start.isoformat()).props("type=date")
+                end_input = ui.input("结束日期", value=common_end.isoformat()).props("type=date")
+                cash_input = ui.number("初始资金（元）", value=1_000_000, min=10_000, step=10_000)
+                benchmark_select = ui.select(
+                    benchmark_options, value=default_benchmark, label="比较基准"
+                ).classes("min-w-64")
+                timing_select = ui.select(
+                    {
+                        ExecutionTiming.NEXT_OPEN.value: "收盘产生信号，下一交易日开盘成交",
+                        ExecutionTiming.NEXT_CLOSE.value: "收盘产生信号，下一交易日收盘成交",
+                    },
+                    value=ExecutionTiming.NEXT_OPEN.value,
+                    label="买卖时机",
+                ).classes("min-w-80")
+            with ui.row().classes("w-full gap-4"):
+                commission_input = ui.number(
+                    "佣金率", value=0.0003, min=0, max=0.01, step=0.0001, format="%.4f"
+                )
+                minimum_commission_input = ui.number("最低佣金（元）", value=5, min=0, step=1)
+                slippage_input = (
+                    ui.number("滑点（基点 / bps）", value=2, min=0, max=999, step=1)
+                    .props("suffix=基点 aria-label=滑点（基点）")
+                    .classes("min-w-48")
+                )
+            with ui.row().classes("w-full gap-4 items-end"):
+                rebalance_select = ui.select(
+                    {
+                        StrategyLabRebalanceMode.SIGNAL_CHANGE.value: "仅信号变化时（推荐）",
+                        StrategyLabRebalanceMode.WEEKLY.value: "每周检查并再平衡",
+                        StrategyLabRebalanceMode.MONTHLY.value: "每月检查并再平衡",
+                        StrategyLabRebalanceMode.DAILY.value: "每日再平衡",
+                    },
+                    value=StrategyLabRebalanceMode.SIGNAL_CHANGE.value,
+                    label="再平衡方式",
+                ).classes("min-w-72")
+                drift_input = ui.number("仓位偏离阈值（%）", value=2, min=0, max=25, step=0.5)
+                minimum_trade_input = ui.number("最小交易金额（元）", value=5000, min=0, step=1000)
+            ui.label(
+                "只有达到再平衡时点，且仓位偏离或预计交易金额达到阈值时才下单，可避免细小仓位变化造成频繁成交。"
+            ).classes("text-xs text-slate-500")
+            ui.label("滑点单位：1 基点（bps）= 0.01%。").classes("text-xs text-slate-500")
+            initial_mode_select = ui.select(
                 {
-                    ExecutionTiming.NEXT_OPEN.value: "收盘产生信号，下一交易日开盘成交",
-                    ExecutionTiming.NEXT_CLOSE.value: "收盘产生信号，下一交易日收盘成交",
+                    "cash": "空仓（100% 现金）",
+                    "custom": "自定义初始持仓",
                 },
-                value=ExecutionTiming.NEXT_OPEN.value,
-                label="买卖时机",
-            ).classes("min-w-80")
-        with ui.row().classes("w-full gap-4"):
-            commission_input = ui.number(
-                "佣金率", value=0.0003, min=0, max=0.01, step=0.0001, format="%.4f"
-            )
-            minimum_commission_input = ui.number("最低佣金（元）", value=5, min=0, step=1)
-            slippage_input = (
-                ui.number("滑点（基点 / bps）", value=2, min=0, max=999, step=1)
-                .props("suffix=基点 aria-label=滑点（基点）")
-                .classes("min-w-48")
-            )
-        with ui.row().classes("w-full gap-4 items-end"):
-            rebalance_select = ui.select(
-                {
-                    StrategyLabRebalanceMode.SIGNAL_CHANGE.value: "仅信号变化时（推荐）",
-                    StrategyLabRebalanceMode.WEEKLY.value: "每周检查并再平衡",
-                    StrategyLabRebalanceMode.MONTHLY.value: "每月检查并再平衡",
-                    StrategyLabRebalanceMode.DAILY.value: "每日再平衡",
-                },
-                value=StrategyLabRebalanceMode.SIGNAL_CHANGE.value,
-                label="再平衡方式",
+                value="cash",
+                label="初始持仓",
             ).classes("min-w-72")
-            drift_input = ui.number("仓位偏离阈值（%）", value=2, min=0, max=25, step=0.5)
-            minimum_trade_input = ui.number("最小交易金额（元）", value=5000, min=0, step=1000)
-        ui.label(
-            "只有达到再平衡时点，且仓位偏离或预计交易金额达到阈值时才下单，可避免细小仓位变化造成频繁成交。"
-        ).classes("text-xs text-slate-500")
-        ui.label("滑点单位：1 基点（bps）= 0.01%。").classes("text-xs text-slate-500")
-        initial_mode_select = ui.select(
-            {
-                "cash": "空仓（100% 现金）",
-                "custom": "自定义初始持仓",
-            },
-            value="cash",
-            label="初始持仓",
-        ).classes("min-w-72")
 
-        @ui.refreshable
-        def initial_position_form() -> None:
-            if str(initial_mode_select.value) != "custom":
-                ui.label("初始账户为空仓，全部资金以现金开始回测。").classes(
-                    "text-sm text-slate-500"
-                )
-                return
-            ui.label("按初始总资产配置比例；现金与所有 ETF 仓位合计必须等于 100%。").classes(
-                "text-sm text-slate-600"
-            )
-            summary = ui.label("").classes("text-sm")
-
-            def update_summary() -> None:
-                total = initial_cash_percentage["value"] + sum(
-                    initial_position_percentages.values(), Decimal("0")
-                )
-                summary.set_text(
-                    f"现金 {initial_cash_percentage['value']:g}% · "
-                    f"ETF {total - initial_cash_percentage['value']:g}% · 合计 {total:g}%"
-                )
-                summary.classes(
-                    replace=(
-                        "text-sm text-emerald-700"
-                        if total == Decimal("100")
-                        else "text-sm text-red-700"
+            @ui.refreshable
+            def initial_position_form() -> None:
+                if str(initial_mode_select.value) != "custom":
+                    ui.label("初始账户为空仓，全部资金以现金开始回测。").classes(
+                        "text-sm text-slate-500"
                     )
+                    return
+                ui.label("按初始总资产配置比例；现金与所有 ETF 仓位合计必须等于 100%。").classes(
+                    "text-sm text-slate-600"
                 )
+                summary = ui.label("").classes("text-sm")
 
-            def update_cash(value: object) -> None:
-                initial_cash_percentage["value"] = Decimal(str(value or 0))
-                update_summary()
-                reset_range()
-                refresh_readiness()
+                def update_summary() -> None:
+                    total = initial_cash_percentage["value"] + sum(
+                        initial_position_percentages.values(), Decimal("0")
+                    )
+                    summary.set_text(
+                        f"现金 {initial_cash_percentage['value']:g}% · "
+                        f"ETF {total - initial_cash_percentage['value']:g}% · 合计 {total:g}%"
+                    )
+                    summary.classes(
+                        replace=(
+                            "text-sm text-emerald-700"
+                            if total == Decimal("100")
+                            else "text-sm text-red-700"
+                        )
+                    )
 
-            def update_position(symbol: str, value: object) -> None:
-                initial_position_percentages[symbol] = Decimal(str(value or 0))
-                update_summary()
-                reset_range()
-                refresh_readiness()
+                def update_cash(value: object) -> None:
+                    initial_cash_percentage["value"] = Decimal(str(value or 0))
+                    update_summary()
+                    reset_range()
+                    refresh_readiness()
 
-            with ui.row().classes("w-full gap-4 items-end flex-wrap"):
-                ui.number(
-                    "初始现金（%）",
-                    value=float(initial_cash_percentage["value"]),
-                    min=0,
-                    max=100,
-                    step=5,
-                ).on_value_change(lambda event: update_cash(event.value))
-                for item in available_etfs:
-                    symbol = str(item.instrument)
+                def update_position(symbol: str, value: object) -> None:
+                    initial_position_percentages[symbol] = Decimal(str(value or 0))
+                    update_summary()
+                    reset_range()
+                    refresh_readiness()
+
+                with ui.row().classes("w-full gap-4 items-end flex-wrap"):
                     ui.number(
-                        f"{item.label} 初始仓位（%）",
-                        value=float(initial_position_percentages[symbol]),
+                        "初始现金（%）",
+                        value=float(initial_cash_percentage["value"]),
                         min=0,
                         max=100,
                         step=5,
-                    ).classes("min-w-80").on_value_change(
-                        lambda event, instrument=symbol: update_position(instrument, event.value)
-                    )
-            update_summary()
+                    ).on_value_change(lambda event: update_cash(event.value))
+                    for item in available_etfs:
+                        symbol = str(item.instrument)
+                        ui.number(
+                            f"{item.label} 初始仓位（%）",
+                            value=float(initial_position_percentages[symbol]),
+                            min=0,
+                            max=100,
+                            step=5,
+                        ).classes("min-w-80").on_value_change(
+                            lambda event, instrument=symbol: update_position(instrument, event.value)
+                        )
+                update_summary()
 
-        def initial_mode_changed() -> None:
-            initial_position_form.refresh()
-            reset_range()
-            refresh_readiness()
+            def initial_mode_changed() -> None:
+                initial_position_form.refresh()
+                reset_range()
+                refresh_readiness()
 
-        initial_mode_select.on_value_change(lambda _: initial_mode_changed())
-        initial_position_form()
-        ui.label("初始账户由上方设置；所有策略在收盘后生成目标，成交时点由上方统一设置。").classes(
-            "text-xs text-slate-500"
-        )
-
-    with ui.card().classes("w-full border border-slate-200 shadow-none"):
-        ui.label("本次回测策略组合").classes("text-lg font-semibold")
-        ui.label("这里的参数只用于本次回测；策略定义、版本和原理说明请在策略实验室管理。").classes(
-            "text-sm text-slate-500"
-        )
-        template_select = ui.select(
-            {
-                item.instance_id: f"{item.name} · {strategy_labels[item.strategy.value]}"
-                for item in initial_state.templates
-            },
-            value=None,
-            label="已保存策略模板（可选）",
-        ).classes("min-w-96")
-        if not initial_state.templates:
-            template_select.disable()
-            ui.label("暂无可用于回测的已启用策略模板；也可以直接配置本次回测。 ").classes(
+            initial_mode_select.on_value_change(lambda _: initial_mode_changed())
+            initial_position_form()
+            ui.label("初始账户由上方设置；所有策略在收盘后生成目标，成交时点由上方统一设置。").classes(
                 "text-xs text-slate-500"
             )
-        strategy_select = ui.select(
-            strategy_labels,
-            value=None,
-            label="添加策略",
-        ).classes("min-w-64")
-        draft_controls: dict[str, object] = {}
 
-        def initial_allocation() -> tuple[Decimal, tuple[StrategyLabInitialPosition, ...]]:
-            if str(initial_mode_select.value) != "custom":
-                return Decimal("1"), ()
-            cash_weight = initial_cash_percentage["value"] / Decimal("100")
-            positions = tuple(
-                StrategyLabInitialPosition(
-                    instrument=InstrumentId.parse(symbol),
-                    target_weight=percentage / Decimal("100"),
-                )
-                for symbol, percentage in initial_position_percentages.items()
-                if percentage > 0
+        with ui.card().classes("w-full border border-slate-200 shadow-none"):
+            ui.label("本次回测策略组合").classes("text-lg font-semibold")
+            ui.label("这里的参数只用于本次回测；策略定义、版本和原理说明请在策略实验室管理。").classes(
+                "text-sm text-slate-500"
             )
-            total = cash_weight + sum((item.target_weight for item in positions), Decimal("0"))
-            if total != Decimal("1"):
-                raise ValueError("初始现金与 ETF 仓位合计必须等于 100%")
-            return cash_weight, positions
+            template_select = ui.select(
+                {
+                    item.instance_id: f"{item.name} · {strategy_labels[item.strategy.value]}"
+                    for item in initial_state.templates
+                },
+                value=None,
+                label="已保存策略模板（可选）",
+            ).classes("min-w-96")
+            if not initial_state.templates:
+                template_select.disable()
+                ui.label("暂无可用于回测的已启用策略模板；也可以直接配置本次回测。 ").classes(
+                    "text-xs text-slate-500"
+                )
+            strategy_select = ui.select(
+                strategy_labels,
+                value=None,
+                label="添加策略",
+            ).classes("min-w-64")
+            draft_controls: dict[str, object] = {}
 
-        def selected_instrument_ids() -> set[str]:
-            selected = {default_benchmark}
-            for strategy in configured_strategies:
-                selected.update(str(item) for item in strategy.instruments)
-                if strategy.signal_instrument is not None:
-                    selected.add(str(strategy.signal_instrument))
-            if str(initial_mode_select.value) == "custom":
-                selected.update(
-                    symbol
+            def initial_allocation() -> tuple[Decimal, tuple[StrategyLabInitialPosition, ...]]:
+                if str(initial_mode_select.value) != "custom":
+                    return Decimal("1"), ()
+                cash_weight = initial_cash_percentage["value"] / Decimal("100")
+                positions = tuple(
+                    StrategyLabInitialPosition(
+                        instrument=InstrumentId.parse(symbol),
+                        target_weight=percentage / Decimal("100"),
+                    )
                     for symbol, percentage in initial_position_percentages.items()
                     if percentage > 0
                 )
-            return selected
+                total = cash_weight + sum((item.target_weight for item in positions), Decimal("0"))
+                if total != Decimal("1"):
+                    raise ValueError("初始现金与 ETF 仓位合计必须等于 100%")
+                return cash_weight, positions
 
-        def reset_range() -> None:
-            selected_items = [by_id[item] for item in selected_instrument_ids()]
-            available_start = max(item.first_day for item in selected_items)
-            available_end = min(item.last_day for item in selected_items)
-            try:
-                requested_start = date.fromisoformat(str(start_input.value))
-                requested_end = date.fromisoformat(str(end_input.value))
-            except ValueError:
-                requested_start, requested_end = available_start, available_end
-            clamped_start = max(requested_start, available_start)
-            clamped_end = min(requested_end, available_end)
-            if clamped_start >= clamped_end:
-                clamped_start, clamped_end = available_start, available_end
-            start_input.value = clamped_start.isoformat()
-            end_input.value = clamped_end.isoformat()
+            def selected_instrument_ids() -> set[str]:
+                selected = {str(benchmark_select.value)}
+                for strategy in configured_strategies:
+                    selected.update(str(item) for item in strategy.instruments)
+                    if strategy.signal_instrument is not None:
+                        selected.add(str(strategy.signal_instrument))
+                if str(initial_mode_select.value) == "custom":
+                    selected.update(
+                        symbol
+                        for symbol, percentage in initial_position_percentages.items()
+                        if percentage > 0
+                    )
+                return selected
 
-        def refresh_readiness() -> None:
-            budget = sum((item.budget for item in configured_strategies), Decimal("0"))
-            if not configured_strategies:
-                readiness_label.set_text("请至少加入一个策略。")
-                readiness_label.classes(replace="text-sm text-amber-700")
-                run_button.disable()
-            elif str(initial_mode_select.value) == "custom" and (
-                initial_cash_percentage["value"]
-                + sum(initial_position_percentages.values(), Decimal("0"))
-                != Decimal("100")
-            ):
-                readiness_label.set_text("初始现金与 ETF 仓位合计必须等于 100%。")
-                readiness_label.classes(replace="text-sm text-red-700")
-                run_button.disable()
-            elif budget > Decimal("1"):
-                readiness_label.set_text(f"策略资金占比合计 {budget * 100:g}%，不能超过 100%。")
-                readiness_label.classes(replace="text-sm text-red-700")
-                run_button.disable()
-            else:
-                target_count = len(
-                    {item for strategy in configured_strategies for item in strategy.instruments}
-                )
-                readiness_label.set_text(
-                    f"已配置 {len(configured_strategies)} 个策略 · "
-                    f"{target_count} 个 ETF · 资金占比 {budget * 100:g}%"
-                )
-                readiness_label.classes(replace="text-sm text-emerald-700")
-                run_button.enable()
+            def reset_range() -> None:
+                selected_items = [by_id[item] for item in selected_instrument_ids()]
+                available_start = max(item.first_day for item in selected_items)
+                available_end = min(item.last_day for item in selected_items)
+                try:
+                    requested_start = date.fromisoformat(str(start_input.value))
+                    requested_end = date.fromisoformat(str(end_input.value))
+                except ValueError:
+                    requested_start, requested_end = available_start, available_end
+                clamped_start = max(requested_start, available_start)
+                clamped_end = min(requested_end, available_end)
+                if clamped_start >= clamped_end:
+                    clamped_start, clamped_end = available_start, available_end
+                start_input.value = clamped_start.isoformat()
+                end_input.value = clamped_end.isoformat()
 
-        def remove_strategy(strategy_id: str) -> None:
-            configured_strategies[:] = [
-                item for item in configured_strategies if item.strategy_id != strategy_id
-            ]
-            reset_range()
-            strategy_cards.refresh()
-            refresh_readiness()
-
-        @ui.refreshable
-        def strategy_cards() -> None:
-            if not configured_strategies:
-                ui.label("组合中还没有策略。").classes("text-sm text-slate-400")
-                return
-            for strategy in configured_strategies:
-                with ui.card().classes("w-full border border-slate-100 bg-slate-50 shadow-none"):
-                    with ui.row().classes("w-full items-center justify-between"):
-                        ui.label(
-                            f"{strategy.strategy_id} · "
-                            f"{strategy_labels[strategy.strategy.value]} · "
-                            f"资金 {strategy.budget * 100:g}%"
-                        ).classes("font-medium")
-                        ui.button(
-                            icon="delete_outline",
-                            on_click=lambda _, strategy_id=strategy.strategy_id: remove_strategy(
-                                strategy_id
-                            ),
-                        ).props("flat round color=negative")
-                    targets = "、".join(by_id[str(item)].label for item in strategy.instruments)
-                    ui.label(f"目标 ETF：{targets}").classes("text-sm text-slate-600")
-                    if strategy.template_name is not None:
-                        ui.label(
-                            f"来源模板：{strategy.template_name}（{strategy.template_instance_id}）"
-                        ).classes("text-xs text-indigo-700")
-                    if strategy.strategy is StrategyLabKind.DUAL_MA:
-                        assert strategy.signal_instrument is not None
-                        ui.label(
-                            f"信号：{by_id[str(strategy.signal_instrument)].label} · "
-                            f"均线 {strategy.short_window}/{strategy.long_window} · "
-                            f"确认 {strategy.confirmation_days} 日"
-                        ).classes("text-xs text-slate-500")
-                    elif strategy.strategy is StrategyLabKind.RULE_DSL:
-                        assert strategy.signal_instrument is not None
-                        exported = "、".join(
-                            item.name for item in strategy.variables if item.optimize
-                        )
-                        rule_summary = (
-                            "、".join(
-                                f"{item.name}（{item.action.value}）"
-                                for item in strategy.dsl_rules
-                            )
-                            if strategy.dsl_rules
-                            else f"买入 {strategy.buy_expression} · 卖出 {strategy.sell_expression}"
-                        )
-                        ui.label(
-                            f"信号：{by_id[str(strategy.signal_instrument)].label} · {rule_summary}"
-                        ).classes("text-xs text-slate-500")
-                        ui.label(f"导出变量：{exported or '无'}").classes("text-xs text-indigo-700")
-                    elif strategy.strategy is StrategyLabKind.KRONOS_FORECAST:
-                        assert strategy.kronos_parameters is not None
-                        kronos = strategy.kronos_parameters
-                        ui.label(
-                            f"{kronos.model_size}/{kronos.device} · 历史 {kronos.lookback} 日 · "
-                            f"预测 {kronos.horizon} 日 · 每 {kronos.rebalance_interval} 日重算"
-                        ).classes("text-xs text-indigo-700")
-
-        def add_strategy() -> None:
-            nonlocal next_strategy_number
-            try:
-                kind = StrategyLabKind(str(strategy_select.value))
-                raw_instruments = getattr(draft_controls["instruments"], "value")
-                if (
-                    not isinstance(raw_instruments, Sequence)
-                    or isinstance(raw_instruments, (str, bytes))
-                    or not raw_instruments
+            def refresh_readiness() -> None:
+                budget = sum((item.budget for item in configured_strategies), Decimal("0"))
+                if not configured_strategies:
+                    readiness_label.set_text("请至少加入一个策略。")
+                    readiness_label.classes(replace="text-sm text-amber-700")
+                    run_button.disable()
+                elif str(initial_mode_select.value) == "custom" and (
+                    initial_cash_percentage["value"]
+                    + sum(initial_position_percentages.values(), Decimal("0"))
+                    != Decimal("100")
                 ):
-                    raise ValueError("至少选择一个目标 ETF")
-                signal_control = draft_controls.get("signal")
-                strategy = StrategyLegConfiguration(
-                    strategy_id=f"strategy-{next_strategy_number}",
-                    strategy=kind,
-                    instruments=tuple(InstrumentId.parse(str(item)) for item in raw_instruments),
-                    budget=(
-                        Decimal(str(getattr(draft_controls["budget"], "value"))) / Decimal("100")
-                    ),
-                    signal_instrument=(
-                        None
-                        if signal_control is None
-                        else InstrumentId.parse(str(getattr(signal_control, "value")))
-                    ),
-                    short_window=int(getattr(draft_controls.get("short"), "value", 20)),
-                    long_window=int(getattr(draft_controls.get("long"), "value", 60)),
-                    confirmation_days=int(getattr(draft_controls.get("confirmation"), "value", 1)),
-                    buy_expression=str(getattr(draft_controls.get("buy_expression"), "value", "")),
-                    sell_expression=str(
-                        getattr(draft_controls.get("sell_expression"), "value", "")
-                    ),
-                    variables=(
-                        ()
-                        if kind is not StrategyLabKind.RULE_DSL
-                        else RuleDslParameters.model_validate_json(
-                            json.dumps(
-                                {
-                                    "buy_expression": str(
-                                        getattr(draft_controls["buy_expression"], "value")
-                                    ),
-                                    "sell_expression": str(
-                                        getattr(draft_controls["sell_expression"], "value")
-                                    ),
-                                    "variables": json.loads(
-                                        str(getattr(draft_controls["variables"], "value"))
-                                    ),
-                                    "target_weight": "1",
-                                },
-                                ensure_ascii=False,
-                            ),
-                            strict=True,
-                        ).variables
-                    ),
-                    dsl_rules=(
-                        ()
-                        if kind is not StrategyLabKind.RULE_DSL
-                        else RuleDslParameters.model_validate_json(
-                            json.dumps(
-                                {
-                                    "buy_expression": str(
-                                        getattr(draft_controls["buy_expression"], "value")
-                                    ),
-                                    "sell_expression": str(
-                                        getattr(draft_controls["sell_expression"], "value")
-                                    ),
-                                    "variables": json.loads(
-                                        str(getattr(draft_controls["variables"], "value"))
-                                    ),
-                                    "rules": draft_controls.get("dsl_rules", ()),
-                                    "target_weight": "1",
-                                },
-                                ensure_ascii=False,
-                            ),
-                            strict=True,
-                        ).rules
-                    ),
-                    kronos_parameters=(
-                        None
-                        if kind is not StrategyLabKind.KRONOS_FORECAST
-                        else KronosForecastParameters(
-                            model_size=str(getattr(draft_controls["kronos_model"], "value")),
-                            device=str(getattr(draft_controls["kronos_device"], "value")),
-                            lookback=int(getattr(draft_controls["kronos_lookback"], "value")),
-                            horizon=int(getattr(draft_controls["kronos_horizon"], "value")),
-                            rebalance_interval=int(
-                                getattr(draft_controls["kronos_rebalance"], "value")
-                            ),
-                            entry_return=Decimal(
-                                str(getattr(draft_controls["kronos_entry"], "value"))
-                            )
-                            / Decimal("100"),
-                            exit_return=Decimal(
-                                str(getattr(draft_controls["kronos_exit"], "value"))
-                            )
-                            / Decimal("100"),
-                            minimum_path_positive_ratio=Decimal(
-                                str(getattr(draft_controls["kronos_positive"], "value"))
-                            )
-                            / Decimal("100"),
-                            trend_window=int(getattr(draft_controls["kronos_trend"], "value")),
-                            top_n=int(getattr(draft_controls["kronos_top_n"], "value")),
-                            target_weight=Decimal("1"),
-                            temperature=float(
-                                getattr(draft_controls["kronos_temperature"], "value")
-                            ),
-                            top_p=float(getattr(draft_controls["kronos_top_p"], "value")),
-                            sample_count=int(getattr(draft_controls["kronos_samples"], "value")),
-                            seed=int(getattr(draft_controls["kronos_seed"], "value")),
-                        )
-                    ),
-                    template_instance_id=(
-                        None
-                        if active_template["value"] is None
-                        else active_template["value"].instance_id
-                    ),
-                    template_name=(
-                        None if active_template["value"] is None else active_template["value"].name
-                    ),
-                )
-                configured_strategies.append(strategy)
-                next_strategy_number += 1
+                    readiness_label.set_text("初始现金与 ETF 仓位合计必须等于 100%。")
+                    readiness_label.classes(replace="text-sm text-red-700")
+                    run_button.disable()
+                elif budget > Decimal("1"):
+                    readiness_label.set_text(f"策略资金占比合计 {budget * 100:g}%，不能超过 100%。")
+                    readiness_label.classes(replace="text-sm text-red-700")
+                    run_button.disable()
+                else:
+                    target_count = len(
+                        {item for strategy in configured_strategies for item in strategy.instruments}
+                    )
+                    readiness_label.set_text(
+                        f"已配置 {len(configured_strategies)} 个策略 · "
+                        f"{target_count} 个 ETF · 资金占比 {budget * 100:g}%"
+                    )
+                    readiness_label.classes(replace="text-sm text-emerald-700")
+                    run_button.enable()
+
+            def remove_strategy(strategy_id: str) -> None:
+                configured_strategies[:] = [
+                    item for item in configured_strategies if item.strategy_id != strategy_id
+                ]
                 reset_range()
                 strategy_cards.refresh()
                 refresh_readiness()
-                ui.notify("策略已加入组合。", type="positive")
-            except (InvalidOperation, KeyError, TypeError, ValueError) as error:
-                ui.notify(f"策略未加入：{error}", type="negative")
+                guard.mark()
 
-        @ui.refreshable
-        def strategy_form() -> None:
-            draft_controls.clear()
-            if strategy_select.value is None:
-                ui.label("请选择一个策略开始配置。").classes("text-sm text-slate-400")
-                return
-            kind = StrategyLabKind(str(strategy_select.value))
-            template = active_template["value"]
-            if template is not None and template.strategy is not kind:
-                template = None
-            parameters = {} if template is None else template.parameters
-            template_targets = (
-                []
-                if template is None
-                else [str(item) for item in template.instruments if str(item) in trade_options]
-            )
-            template_signal = default_signal
-            if template is not None:
-                template_signal = next(
-                    (
-                        str(index)
-                        for index, etf in common_index_etf_pairs()
-                        if etf in template.instruments and str(index) in signal_options
-                    ),
-                    default_signal,
-                )
-            try:
-                budget_default = float(
-                    Decimal(str(parameters.get("target_weight", "0.5"))) * Decimal("100")
-                )
-            except (InvalidOperation, ValueError):
-                budget_default = 50.0
-            budget_default = min(100.0, max(1.0, budget_default))
-            with ui.row().classes("w-full items-end gap-4"):
-                if kind in {StrategyLabKind.DUAL_MA, StrategyLabKind.RULE_DSL}:
-                    draft_controls["signal"] = ui.select(
-                        signal_options,
-                        value=template_signal,
-                        label="信号标的",
-                    ).classes("min-w-72")
-                draft_controls["instruments"] = (
-                    ui.select(
-                        trade_options,
-                        value=template_targets,
-                        label="目标 ETF（可多选）",
-                        multiple=True,
-                    )
-                    .props("use-chips")
-                    .classes("min-w-96")
-                )
-                draft_controls["budget"] = ui.number(
-                    "资金占比（%）", value=budget_default, min=1, max=100, step=5
-                )
-            if kind is StrategyLabKind.DUAL_MA:
-                with ui.row().classes("w-full gap-4"):
-                    draft_controls["short"] = ui.number(
-                        "短均线（日）",
-                        value=_template_positive_int(parameters, "short_window", 20),
-                        min=1,
-                        step=1,
-                    )
-                    draft_controls["long"] = ui.number(
-                        "长均线（日）",
-                        value=_template_positive_int(parameters, "long_window", 60),
-                        min=2,
-                        step=1,
-                    )
-                    draft_controls["confirmation"] = ui.number(
-                        "连续确认（日）",
-                        value=_template_positive_int(parameters, "confirmation_days", 1),
-                        min=1,
-                        step=1,
-                    )
-            if kind is StrategyLabKind.RULE_DSL:
-                editable_rules = _editable_json(parameters.get("rules", ()))
-                raw_rules = editable_rules if isinstance(editable_rules, list) else []
-                draft_controls["dsl_rules"] = raw_rules
-                if raw_rules:
-                    ui.label(
-                        f"使用模板中的 {len(raw_rules)} 条分级仓位规则；如需修改动作或条件，请回到策略实验室创建新版本。"
-                    ).classes("text-sm text-indigo-700")
-                buy_control = ui.textarea(
-                    "买入 DSL",
-                    value=str(
-                        parameters.get(
-                            "buy_expression",
-                            "cross_above(sma(close, fast_window), sma(close, slow_window))",
-                        )
-                    ),
-                ).classes("w-full font-mono")
-                sell_control = ui.textarea(
-                    "卖出 DSL",
-                    value=str(
-                        parameters.get(
-                            "sell_expression",
-                            "cross_below(sma(close, fast_window), sma(close, slow_window))",
-                        )
-                    ),
-                ).classes("w-full font-mono")
-                if raw_rules:
-                    buy_control.props("readonly")
-                    sell_control.props("readonly")
-                draft_controls["buy_expression"] = buy_control
-                draft_controls["sell_expression"] = sell_control
-                draft_controls["variables"] = ui.textarea(
-                    "导出变量 JSON",
-                    value=json.dumps(
-                        _editable_json(
-                            parameters.get(
-                                "variables",
-                                [
+            @ui.refreshable
+            def strategy_cards() -> None:
+                if not configured_strategies:
+                    ui.label("组合中还没有策略。").classes("text-sm text-slate-400")
+                    return
+                for strategy in configured_strategies:
+                    with ui.card().classes("w-full border border-slate-100 bg-slate-50 shadow-none"):
+                        with ui.row().classes("w-full items-center justify-between"):
+                            ui.label(
+                                f"{strategy.strategy_id} · "
+                                f"{strategy_labels[strategy.strategy.value]} · "
+                                f"资金 {strategy.budget * 100:g}%"
+                            ).classes("font-medium")
+                            ui.button(
+                                icon="delete_outline",
+                                on_click=lambda _, strategy_id=strategy.strategy_id: remove_strategy(
+                                    strategy_id
+                                ),
+                            ).props("flat round color=negative")
+                        targets = "、".join(by_id[str(item)].label for item in strategy.instruments)
+                        ui.label(f"目标 ETF：{targets}").classes("text-sm text-slate-600")
+                        if strategy.template_name is not None:
+                            ui.label(
+                                f"来源模板：{strategy.template_name}（{strategy.template_instance_id}）"
+                            ).classes("text-xs text-indigo-700")
+                        if strategy.strategy is StrategyLabKind.DUAL_MA:
+                            assert strategy.signal_instrument is not None
+                            ui.label(
+                                f"信号：{by_id[str(strategy.signal_instrument)].label} · "
+                                f"均线 {strategy.short_window}/{strategy.long_window} · "
+                                f"确认 {strategy.confirmation_days} 日"
+                            ).classes("text-xs text-slate-500")
+                        elif strategy.strategy is StrategyLabKind.RULE_DSL:
+                            assert strategy.signal_instrument is not None
+                            exported = "、".join(
+                                item.name for item in strategy.variables if item.optimize
+                            )
+                            rule_summary = (
+                                "、".join(
+                                    f"{item.name}（{item.action.value}）"
+                                    for item in strategy.dsl_rules
+                                )
+                                if strategy.dsl_rules
+                                else f"买入 {strategy.buy_expression} · 卖出 {strategy.sell_expression}"
+                            )
+                            ui.label(
+                                f"信号：{by_id[str(strategy.signal_instrument)].label} · {rule_summary}"
+                            ).classes("text-xs text-slate-500")
+                            ui.label(f"导出变量：{exported or '无'}").classes("text-xs text-indigo-700")
+                        elif strategy.strategy is StrategyLabKind.KRONOS_FORECAST:
+                            assert strategy.kronos_parameters is not None
+                            kronos = strategy.kronos_parameters
+                            ui.label(
+                                f"{kronos.model_size}/{kronos.device} · 历史 {kronos.lookback} 日 · "
+                                f"预测 {kronos.horizon} 日 · 每 {kronos.rebalance_interval} 日重算"
+                            ).classes("text-xs text-indigo-700")
+
+            def add_strategy() -> None:
+                nonlocal next_strategy_number
+                try:
+                    kind = StrategyLabKind(str(strategy_select.value))
+                    raw_instruments = getattr(draft_controls["instruments"], "value")
+                    if (
+                        not isinstance(raw_instruments, Sequence)
+                        or isinstance(raw_instruments, (str, bytes))
+                        or not raw_instruments
+                    ):
+                        raise ValueError("至少选择一个目标 ETF")
+                    signal_control = draft_controls.get("signal")
+                    strategy = StrategyLegConfiguration(
+                        strategy_id=f"strategy-{next_strategy_number}",
+                        strategy=kind,
+                        instruments=tuple(InstrumentId.parse(str(item)) for item in raw_instruments),
+                        budget=(
+                            Decimal(str(getattr(draft_controls["budget"], "value"))) / Decimal("100")
+                        ),
+                        signal_instrument=(
+                            None
+                            if signal_control is None
+                            else InstrumentId.parse(str(getattr(signal_control, "value")))
+                        ),
+                        short_window=int(getattr(draft_controls.get("short"), "value", 20)),
+                        long_window=int(getattr(draft_controls.get("long"), "value", 60)),
+                        confirmation_days=int(getattr(draft_controls.get("confirmation"), "value", 1)),
+                        buy_expression=str(getattr(draft_controls.get("buy_expression"), "value", "")),
+                        sell_expression=str(
+                            getattr(draft_controls.get("sell_expression"), "value", "")
+                        ),
+                        variables=(
+                            ()
+                            if kind is not StrategyLabKind.RULE_DSL
+                            else RuleDslParameters.model_validate_json(
+                                json.dumps(
                                     {
-                                        "name": "fast_window",
-                                        "value": "20",
-                                        "minimum": "5",
-                                        "maximum": "40",
-                                        "step": "5",
-                                        "optimize": True,
+                                        "buy_expression": str(
+                                            getattr(draft_controls["buy_expression"], "value")
+                                        ),
+                                        "sell_expression": str(
+                                            getattr(draft_controls["sell_expression"], "value")
+                                        ),
+                                        "variables": json.loads(
+                                            str(getattr(draft_controls["variables"], "value"))
+                                        ),
+                                        "target_weight": "1",
                                     },
+                                    ensure_ascii=False,
+                                ),
+                                strict=True,
+                            ).variables
+                        ),
+                        dsl_rules=(
+                            ()
+                            if kind is not StrategyLabKind.RULE_DSL
+                            else RuleDslParameters.model_validate_json(
+                                json.dumps(
                                     {
-                                        "name": "slow_window",
-                                        "value": "60",
-                                        "minimum": "40",
-                                        "maximum": "200",
-                                        "step": "20",
-                                        "optimize": True,
+                                        "buy_expression": str(
+                                            getattr(draft_controls["buy_expression"], "value")
+                                        ),
+                                        "sell_expression": str(
+                                            getattr(draft_controls["sell_expression"], "value")
+                                        ),
+                                        "variables": json.loads(
+                                            str(getattr(draft_controls["variables"], "value"))
+                                        ),
+                                        "rules": draft_controls.get("dsl_rules", ()),
+                                        "target_weight": "1",
                                     },
-                                ],
+                                    ensure_ascii=False,
+                                ),
+                                strict=True,
+                            ).rules
+                        ),
+                        kronos_parameters=(
+                            None
+                            if kind is not StrategyLabKind.KRONOS_FORECAST
+                            else KronosForecastParameters(
+                                model_size=str(getattr(draft_controls["kronos_model"], "value")),
+                                device=str(getattr(draft_controls["kronos_device"], "value")),
+                                lookback=int(getattr(draft_controls["kronos_lookback"], "value")),
+                                horizon=int(getattr(draft_controls["kronos_horizon"], "value")),
+                                rebalance_interval=int(
+                                    getattr(draft_controls["kronos_rebalance"], "value")
+                                ),
+                                entry_return=Decimal(
+                                    str(getattr(draft_controls["kronos_entry"], "value"))
+                                )
+                                / Decimal("100"),
+                                exit_return=Decimal(
+                                    str(getattr(draft_controls["kronos_exit"], "value"))
+                                )
+                                / Decimal("100"),
+                                minimum_path_positive_ratio=Decimal(
+                                    str(getattr(draft_controls["kronos_positive"], "value"))
+                                )
+                                / Decimal("100"),
+                                trend_window=int(getattr(draft_controls["kronos_trend"], "value")),
+                                top_n=int(getattr(draft_controls["kronos_top_n"], "value")),
+                                target_weight=Decimal("1"),
+                                temperature=float(
+                                    getattr(draft_controls["kronos_temperature"], "value")
+                                ),
+                                top_p=float(getattr(draft_controls["kronos_top_p"], "value")),
+                                sample_count=int(getattr(draft_controls["kronos_samples"], "value")),
+                                seed=int(getattr(draft_controls["kronos_seed"], "value")),
                             )
                         ),
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                ).classes("w-full font-mono")
-            if kind is StrategyLabKind.KRONOS_FORECAST:
-                ui.label(
-                    "模型在每个重算日批量预测目标 ETF，先按预测收益排名，再用趋势过滤和阈值生成仓位。"
-                ).classes("text-sm text-slate-600")
-                ui.label(
-                    "严格样本外评估前，请先确认所用模型的预训练数据截止日期。"
-                ).classes("text-xs text-amber-700")
-                runtime_status = kronos_runtime_status()
-                ui.label(runtime_status.display_text).classes(
-                    "text-xs " + ("text-emerald-700" if runtime_status.cuda_available else "text-amber-700")
-                )
-                if runtime_status.action_text is not None:
-                    ui.label(runtime_status.action_text).classes("text-xs text-slate-500 font-mono")
-                with ui.row().classes("w-full gap-4"):
-                    draft_controls["kronos_model"] = ui.select(
-                        {"mini": "mini（推荐/轻量）", "small": "small", "base": "base"},
-                        value=str(parameters.get("model_size", "mini")),
-                        label="模型",
-                    )
-                    draft_controls["kronos_device"] = ui.select(
-                        {"auto": "自动", "cuda": "NVIDIA GPU", "cpu": "CPU", "mps": "Apple GPU"},
-                        value=str(parameters.get("device", "auto")),
-                        label="推理设备",
-                    )
-                    draft_controls["kronos_lookback"] = ui.number(
-                        "历史窗口（日）",
-                        value=_template_positive_int(parameters, "lookback", 256),
-                        min=64,
-                        max=2048,
-                    )
-                    draft_controls["kronos_horizon"] = ui.number(
-                        "预测周期（日）",
-                        value=_template_positive_int(parameters, "horizon", 5),
-                        min=1,
-                        max=60,
-                    )
-                    draft_controls["kronos_rebalance"] = ui.number(
-                        "重算间隔（日）",
-                        value=_template_positive_int(parameters, "rebalance_interval", 5),
-                        min=1,
-                        max=60,
-                    )
-                with ui.row().classes("w-full gap-4"):
-                    draft_controls["kronos_entry"] = ui.number(
-                        "买入阈值（%）",
-                        value=float(Decimal(str(parameters.get("entry_return", "0.02"))) * 100),
-                    )
-                    draft_controls["kronos_exit"] = ui.number(
-                        "退出阈值（%）",
-                        value=float(Decimal(str(parameters.get("exit_return", "-0.01"))) * 100),
-                    )
-                    draft_controls["kronos_positive"] = ui.number(
-                        "正向路径比例（%）",
-                        value=float(
-                            Decimal(str(parameters.get("minimum_path_positive_ratio", "0.60")))
-                            * 100
+                        template_instance_id=(
+                            None
+                            if active_template["value"] is None
+                            else active_template["value"].instance_id
                         ),
-                        min=0,
-                        max=100,
+                        template_name=(
+                            None if active_template["value"] is None else active_template["value"].name
+                        ),
                     )
-                    draft_controls["kronos_trend"] = ui.number(
-                        "趋势窗口（日）",
-                        value=_template_positive_int(parameters, "trend_window", 60),
-                        min=2,
-                        max=512,
-                    )
-                    draft_controls["kronos_top_n"] = ui.number(
-                        "最多持有",
-                        value=_template_positive_int(parameters, "top_n", 2),
-                        min=1,
-                        max=20,
-                    )
-                with ui.row().classes("w-full gap-4"):
-                    draft_controls["kronos_temperature"] = ui.number(
-                        "采样温度",
-                        value=_template_float(parameters, "temperature", 0.8),
-                        min=0.01,
-                        max=2,
-                        step=0.1,
-                    )
-                    draft_controls["kronos_top_p"] = ui.number(
-                        "Top P",
-                        value=_template_float(parameters, "top_p", 0.9),
-                        min=0.01,
-                        max=1,
-                        step=0.05,
-                    )
-                    draft_controls["kronos_samples"] = ui.number(
-                        "采样路径",
-                        value=_template_positive_int(parameters, "sample_count", 3),
-                        min=1,
-                        max=20,
-                    )
-                    draft_controls["kronos_seed"] = ui.number(
-                        "随机种子",
-                        value=max(0, int(_template_float(parameters, "seed", 42))),
-                        min=0,
-                    )
-            if kind in {StrategyLabKind.RULE_DSL, StrategyLabKind.KRONOS_FORECAST}:
-                ui.label(
-                    "已保存模板会自动带入参数；本次回测仍可修改，实际参数会写入回测快照。"
-                ).classes("text-xs text-slate-500")
-            if template is not None:
-                ui.label(
-                    f"已载入模板：{template.name} · 版本 {template.strategy_version}；信号标的、目标 ETF 和资金占比仍可调整。"
-                ).classes("text-xs text-indigo-700")
-            ui.button("加入策略组合", on_click=add_strategy, icon="add").props("outline")
+                    configured_strategies.append(strategy)
+                    guard.mark()
+                    next_strategy_number += 1
+                    reset_range()
+                    strategy_cards.refresh()
+                    refresh_readiness()
+                    ui.notify("策略已加入组合。", type="positive")
+                except (InvalidOperation, KeyError, TypeError, ValueError) as error:
+                    ui.notify(f"策略未加入：{error}", type="negative")
 
-        def select_template() -> None:
-            template = templates_by_id.get(str(template_select.value))
-            active_template["value"] = template
-            if template is not None:
-                strategy_select.value = template.strategy.value
-            strategy_form.refresh()
-
-        def select_strategy_kind() -> None:
-            template = active_template["value"]
-            if template is not None and str(strategy_select.value) != template.strategy.value:
-                active_template["value"] = None
-                template_select.value = None
-            strategy_form.refresh()
-
-        template_select.on_value_change(lambda _: select_template())
-        strategy_select.on_value_change(lambda _: select_strategy_kind())
-        strategy_form()
-        ui.separator()
-        strategy_cards()
-        readiness_label = ui.label("").classes("text-sm")
-
-        def configuration() -> StrategyLabConfiguration:
-            try:
-                initial_cash_weight, initial_positions = initial_allocation()
-                benchmark = next(
-                    (
-                        strategy.signal_instrument
-                        for strategy in configured_strategies
-                        if strategy.signal_instrument is not None
-                    ),
-                    InstrumentId.parse(default_benchmark),
+            @ui.refreshable
+            def strategy_form() -> None:
+                draft_controls.clear()
+                if strategy_select.value is None:
+                    ui.label("请选择一个策略开始配置。").classes("text-sm text-slate-400")
+                    return
+                kind = StrategyLabKind(str(strategy_select.value))
+                template = active_template["value"]
+                if template is not None and template.strategy is not kind:
+                    template = None
+                parameters = {} if template is None else template.parameters
+                template_targets = (
+                    []
+                    if template is None
+                    else [str(item) for item in template.instruments if str(item) in trade_options]
                 )
-                return StrategyLabConfiguration(
-                    strategies=tuple(configured_strategies),
-                    benchmark=benchmark,
-                    start=date.fromisoformat(str(start_input.value)),
-                    end=date.fromisoformat(str(end_input.value)),
-                    initial_cash=Decimal(str(cash_input.value)).quantize(Decimal("0.01")),
-                    commission_rate=Decimal(str(commission_input.value)),
-                    minimum_commission=Decimal(str(minimum_commission_input.value)),
-                    slippage_bps=Decimal(str(slippage_input.value)),
-                    execution_timing=ExecutionTiming(str(timing_select.value)),
-                    rebalance_mode=StrategyLabRebalanceMode(str(rebalance_select.value)),
-                    rebalance_drift=Decimal(str(drift_input.value)) / Decimal("100"),
-                    minimum_trade_amount=Decimal(str(minimum_trade_input.value)).quantize(
-                        Decimal("0.01")
-                    ),
-                    initial_cash_weight=initial_cash_weight,
-                    initial_positions=initial_positions,
-                )
-            except (InvalidOperation, TypeError, ValueError) as error:
-                raise ValueError("BACKTEST_CONFIGURATION_INVALID") from error
+                template_signal = default_signal
+                if template is not None:
+                    template_signal = next(
+                        (
+                            str(index)
+                            for index, etf in common_index_etf_pairs()
+                            if etf in template.instruments and str(index) in signal_options
+                        ),
+                        default_signal,
+                    )
+                try:
+                    budget_default = float(
+                        Decimal(str(parameters.get("target_weight", "0.5"))) * Decimal("100")
+                    )
+                except (InvalidOperation, ValueError):
+                    budget_default = 50.0
+                budget_default = min(100.0, max(1.0, budget_default))
+                with ui.row().classes("w-full items-end gap-4"):
+                    if kind in {StrategyLabKind.DUAL_MA, StrategyLabKind.RULE_DSL}:
+                        draft_controls["signal"] = ui.select(
+                            signal_options,
+                            value=template_signal,
+                            label="信号标的",
+                        ).classes("min-w-72")
+                    draft_controls["instruments"] = (
+                        ui.select(
+                            trade_options,
+                            value=template_targets,
+                            label="目标 ETF（可多选）",
+                            multiple=True,
+                        )
+                        .props("use-chips")
+                        .classes("min-w-96")
+                    )
+                    draft_controls["budget"] = ui.number(
+                        "资金占比（%）", value=budget_default, min=1, max=100, step=5
+                    )
+                if kind is StrategyLabKind.DUAL_MA:
+                    with ui.row().classes("w-full gap-4"):
+                        draft_controls["short"] = ui.number(
+                            "短均线（日）",
+                            value=_template_positive_int(parameters, "short_window", 20),
+                            min=1,
+                            step=1,
+                        )
+                        draft_controls["long"] = ui.number(
+                            "长均线（日）",
+                            value=_template_positive_int(parameters, "long_window", 60),
+                            min=2,
+                            step=1,
+                        )
+                        draft_controls["confirmation"] = ui.number(
+                            "连续确认（日）",
+                            value=_template_positive_int(parameters, "confirmation_days", 1),
+                            min=1,
+                            step=1,
+                        )
+                if kind is StrategyLabKind.RULE_DSL:
+                    editable_rules = _editable_json(parameters.get("rules", ()))
+                    raw_rules = editable_rules if isinstance(editable_rules, list) else []
+                    draft_controls["dsl_rules"] = raw_rules
+                    if raw_rules:
+                        ui.label(
+                            f"使用模板中的 {len(raw_rules)} 条分级仓位规则；如需修改动作或条件，请回到策略实验室创建新版本。"
+                        ).classes("text-sm text-indigo-700")
+                    buy_control = ui.textarea(
+                        "买入 DSL",
+                        value=str(
+                            parameters.get(
+                                "buy_expression",
+                                "cross_above(sma(close, fast_window), sma(close, slow_window))",
+                            )
+                        ),
+                    ).classes("w-full font-mono")
+                    sell_control = ui.textarea(
+                        "卖出 DSL",
+                        value=str(
+                            parameters.get(
+                                "sell_expression",
+                                "cross_below(sma(close, fast_window), sma(close, slow_window))",
+                            )
+                        ),
+                    ).classes("w-full font-mono")
+                    if raw_rules:
+                        buy_control.props("readonly")
+                        sell_control.props("readonly")
+                    draft_controls["buy_expression"] = buy_control
+                    draft_controls["sell_expression"] = sell_control
+                    draft_controls["variables"] = ui.textarea(
+                        "导出变量 JSON",
+                        value=json.dumps(
+                            _editable_json(
+                                parameters.get(
+                                    "variables",
+                                    [
+                                        {
+                                            "name": "fast_window",
+                                            "value": "20",
+                                            "minimum": "5",
+                                            "maximum": "40",
+                                            "step": "5",
+                                            "optimize": True,
+                                        },
+                                        {
+                                            "name": "slow_window",
+                                            "value": "60",
+                                            "minimum": "40",
+                                            "maximum": "200",
+                                            "step": "20",
+                                            "optimize": True,
+                                        },
+                                    ],
+                                )
+                            ),
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                    ).classes("w-full font-mono")
+                if kind is StrategyLabKind.KRONOS_FORECAST:
+                    ui.label(
+                        "模型在每个重算日批量预测目标 ETF，先按预测收益排名，再用趋势过滤和阈值生成仓位。"
+                    ).classes("text-sm text-slate-600")
+                    ui.label(
+                        "严格样本外评估前，请先确认所用模型的预训练数据截止日期。"
+                    ).classes("text-xs text-amber-700")
+                    runtime_status = kronos_runtime_status()
+                    ui.label(runtime_status.display_text).classes(
+                        "text-xs " + ("text-emerald-700" if runtime_status.cuda_available else "text-amber-700")
+                    )
+                    if runtime_status.action_text is not None:
+                        ui.label(runtime_status.action_text).classes("text-xs text-slate-500 font-mono")
+                    with ui.row().classes("w-full gap-4"):
+                        draft_controls["kronos_model"] = ui.select(
+                            {"mini": "mini（推荐/轻量）", "small": "small", "base": "base"},
+                            value=str(parameters.get("model_size", "mini")),
+                            label="模型",
+                        )
+                        draft_controls["kronos_device"] = ui.select(
+                            {"auto": "自动", "cuda": "NVIDIA GPU", "cpu": "CPU", "mps": "Apple GPU"},
+                            value=str(parameters.get("device", "auto")),
+                            label="推理设备",
+                        )
+                        draft_controls["kronos_lookback"] = ui.number(
+                            "历史窗口（日）",
+                            value=_template_positive_int(parameters, "lookback", 256),
+                            min=64,
+                            max=2048,
+                        )
+                        draft_controls["kronos_horizon"] = ui.number(
+                            "预测周期（日）",
+                            value=_template_positive_int(parameters, "horizon", 5),
+                            min=1,
+                            max=60,
+                        )
+                        draft_controls["kronos_rebalance"] = ui.number(
+                            "重算间隔（日）",
+                            value=_template_positive_int(parameters, "rebalance_interval", 5),
+                            min=1,
+                            max=60,
+                        )
+                    with ui.row().classes("w-full gap-4"):
+                        draft_controls["kronos_entry"] = ui.number(
+                            "买入阈值（%）",
+                            value=float(Decimal(str(parameters.get("entry_return", "0.02"))) * 100),
+                        )
+                        draft_controls["kronos_exit"] = ui.number(
+                            "退出阈值（%）",
+                            value=float(Decimal(str(parameters.get("exit_return", "-0.01"))) * 100),
+                        )
+                        draft_controls["kronos_positive"] = ui.number(
+                            "正向路径比例（%）",
+                            value=float(
+                                Decimal(str(parameters.get("minimum_path_positive_ratio", "0.60")))
+                                * 100
+                            ),
+                            min=0,
+                            max=100,
+                        )
+                        draft_controls["kronos_trend"] = ui.number(
+                            "趋势窗口（日）",
+                            value=_template_positive_int(parameters, "trend_window", 60),
+                            min=2,
+                            max=512,
+                        )
+                        draft_controls["kronos_top_n"] = ui.number(
+                            "最多持有",
+                            value=_template_positive_int(parameters, "top_n", 2),
+                            min=1,
+                            max=20,
+                        )
+                    with ui.row().classes("w-full gap-4"):
+                        draft_controls["kronos_temperature"] = ui.number(
+                            "采样温度",
+                            value=_template_float(parameters, "temperature", 0.8),
+                            min=0.01,
+                            max=2,
+                            step=0.1,
+                        )
+                        draft_controls["kronos_top_p"] = ui.number(
+                            "Top P",
+                            value=_template_float(parameters, "top_p", 0.9),
+                            min=0.01,
+                            max=1,
+                            step=0.05,
+                        )
+                        draft_controls["kronos_samples"] = ui.number(
+                            "采样路径",
+                            value=_template_positive_int(parameters, "sample_count", 3),
+                            min=1,
+                            max=20,
+                        )
+                        draft_controls["kronos_seed"] = ui.number(
+                            "随机种子",
+                            value=max(0, int(_template_float(parameters, "seed", 42))),
+                            min=0,
+                        )
+                if kind in {StrategyLabKind.RULE_DSL, StrategyLabKind.KRONOS_FORECAST}:
+                    ui.label(
+                        "已保存模板会自动带入参数；本次回测仍可修改，实际参数会写入回测快照。"
+                    ).classes("text-xs text-slate-500")
+                if template is not None:
+                    ui.label(
+                        f"已载入模板：{template.name} · 版本 {template.strategy_version}；信号标的、目标 ETF 和资金占比仍可调整。"
+                    ).classes("text-xs text-indigo-700")
+                ui.button("加入策略组合", on_click=add_strategy, icon="add").props("outline")
 
-        def start_backtest() -> None:
-            try:
-                model.start(configuration())
-            except Exception as error:
-                ui.notify(
-                    f"回测未启动：{getattr(error, 'code', str(error) or 'BACKTEST_SUBMISSION_FAILED')}",
-                    type="negative",
-                )
-                return
-            ui.notify("回测任务已启动。", type="positive")
-            run_button.disable()
-            status_panel.refresh()
-            poll_timer.activate()
+            def select_template() -> None:
+                template = templates_by_id.get(str(template_select.value))
+                active_template["value"] = template
+                if template is not None:
+                    strategy_select.value = template.strategy.value
+                strategy_form.refresh()
 
-        with ui.row().classes("items-center gap-3"):
-            run_button = ui.button("运行回测", on_click=start_backtest, icon="play_arrow").props(
-                "color=primary"
-            )
-            ui.button(
-                "前往策略实验室",
-                on_click=lambda: ui.navigate.to("/strategies"),
-                icon="science",
-            ).props("flat")
-            ui.button(
-                "前往标的池添加 ETF",
-                on_click=lambda: ui.navigate.to("/watchlists"),
-                icon="playlist_add",
-            ).props("flat")
+            def select_strategy_kind() -> None:
+                template = active_template["value"]
+                if template is not None and str(strategy_select.value) != template.strategy.value:
+                    active_template["value"] = None
+                    template_select.value = None
+                strategy_form.refresh()
+
+            template_select.on_value_change(lambda _: select_template())
+            strategy_select.on_value_change(lambda _: select_strategy_kind())
+            strategy_form()
+            ui.separator()
+            strategy_cards()
+            readiness_label = ui.label("").classes("text-sm")
+
+            def configuration() -> StrategyLabConfiguration:
+                try:
+                    initial_cash_weight, initial_positions = initial_allocation()
+                    benchmark = InstrumentId.parse(str(benchmark_select.value))
+                    return StrategyLabConfiguration(
+                        strategies=tuple(configured_strategies),
+                        benchmark=benchmark,
+                        start=date.fromisoformat(str(start_input.value)),
+                        end=date.fromisoformat(str(end_input.value)),
+                        initial_cash=Decimal(str(cash_input.value)).quantize(Decimal("0.01")),
+                        commission_rate=Decimal(str(commission_input.value)),
+                        minimum_commission=Decimal(str(minimum_commission_input.value)),
+                        slippage_bps=Decimal(str(slippage_input.value)),
+                        execution_timing=ExecutionTiming(str(timing_select.value)),
+                        rebalance_mode=StrategyLabRebalanceMode(str(rebalance_select.value)),
+                        rebalance_drift=Decimal(str(drift_input.value)) / Decimal("100"),
+                        minimum_trade_amount=Decimal(str(minimum_trade_input.value)).quantize(
+                            Decimal("0.01")
+                        ),
+                        initial_cash_weight=initial_cash_weight,
+                        initial_positions=initial_positions,
+                    )
+                except (InvalidOperation, TypeError, ValueError) as error:
+                    raise ValueError("BACKTEST_CONFIGURATION_INVALID") from error
+
+            def start_backtest() -> None:
+                try:
+                    selected_configuration = configuration()
+                    if model.workspace:
+                        model.save_configuration("上次运行配置", selected_configuration, key="last-run")
+                    model.start(selected_configuration)
+                except Exception as error:
+                    ui.notify(
+                        f"回测未启动：{getattr(error, 'code', str(error) or 'BACKTEST_SUBMISSION_FAILED')}",
+                        type="negative",
+                    )
+                    return
+                ui.notify("回测任务已启动。", type="positive")
+                guard.clear()
+                run_button.disable()
+                status_panel.refresh()
+                poll_timer.activate()
+                sections.set_value(result_tab)
+
+            def save_configuration() -> None:
+                try:
+                    saved = model.save_configuration(str(config_name.value), configuration())
+                except Exception as error:
+                    ui.notify(f"配置未保存：{error}", type="negative")
+                    return
+                saved_select.set_options({item.key: item.name for item in model.saved_configurations()})
+                saved_select.set_value(saved.key)
+                guard.clear()
+                ui.notify("研究配置已保存，可在下次启动时载入。", type="positive")
+
+            with ui.row().classes("items-center gap-3"):
+                run_button = ui.button("运行回测", on_click=start_backtest, icon="play_arrow").props(
+                    "color=primary"
+                )
+                ui.button("保存配置", icon="save", on_click=save_configuration).props("outline")
+                ui.button(
+                    "前往策略实验室",
+                    on_click=lambda: guard.navigate("/strategies"),
+                    icon="science",
+                ).props("flat")
+                ui.button(
+                    "前往标的池添加 ETF",
+                    on_click=lambda: guard.navigate("/watchlists"),
+                    icon="playlist_add",
+                ).props("flat")
+            refresh_readiness()
+
+    if restored is not None:
+        configured_strategies[:] = restored.strategies
+        next_strategy_number = 1
+        while f"strategy-{next_strategy_number}" in {item.strategy_id for item in configured_strategies}:
+            next_strategy_number += 1
+        cash_input.set_value(float(restored.initial_cash))
+        timing_select.set_value(restored.execution_timing.value)
+        commission_input.set_value(float(restored.commission_rate))
+        minimum_commission_input.set_value(float(restored.minimum_commission))
+        slippage_input.set_value(float(restored.slippage_bps))
+        rebalance_select.set_value(restored.rebalance_mode.value)
+        drift_input.set_value(float(restored.rebalance_drift * 100))
+        minimum_trade_input.set_value(float(restored.minimum_trade_amount))
+        initial_cash_percentage["value"] = restored.initial_cash_weight * 100
+        for position in restored.initial_positions:
+            initial_position_percentages[str(position.instrument)] = position.target_weight * 100
+        initial_mode_select.set_value("custom" if restored.initial_positions else "cash")
+        initial_position_form.refresh()
+        strategy_cards.refresh()
+        start_input.set_value(restored.start.isoformat())
+        end_input.set_value(restored.end.isoformat())
         refresh_readiness()
+        guard.clear()
 
     def refresh_history_and_result() -> None:
         history_panel.refresh()
         status_panel.refresh()
+
+    comparison_selected: dict[str, bool] = {}
+
+    def compare_selected() -> None:
+        try:
+            reports = model.comparison_reports([
+                run_id for run_id, selected in comparison_selected.items() if selected
+            ])
+        except Exception as error:
+            ui.notify(str(error), type="negative")
+            return
+        with ui.dialog() as comparison_dialog, ui.card().classes("w-full max-w-6xl"):
+            ui.label("实验对比").classes("text-xl font-semibold")
+            ui.label("曲线按各自首日净值归一为 1；不同日期、费用和行情版本会影响可比性。").classes("text-sm text-slate-600")
+            rows = [{
+                "run": report.run_id,
+                "period": f"{report.result.ledger[0].trading_day} 至 {report.result.ledger[-1].trading_day}",
+                "return": _percent(report.metrics.total_return),
+                "annualized": _percent(report.metrics.annualized_return),
+                "drawdown": _percent(report.metrics.maximum_drawdown),
+                "sharpe": _number(report.metrics.sharpe_ratio),
+                "costs": _number(report.metrics.total_costs),
+            } for report in reports]
+            ui.table(columns=[{"name": key, "field": key, "label": label} for key, label in (
+                ("run", "实验"), ("period", "实际区间"), ("return", "累计收益"),
+                ("annualized", "年化收益"), ("drawdown", "最大回撤"),
+                ("sharpe", "夏普"), ("costs", "总费用"),
+            )], rows=rows, row_key="run").classes("w-full")
+            days = sorted({str(row.trading_day) for report in reports for row in report.result.ledger})
+            series = []
+            for report in reports:
+                base = report.result.ledger[0].equity
+                values = {str(row.trading_day): float(row.equity / base) for row in report.result.ledger}
+                series.append({"name": report.run_id, "type": "line", "showSymbol": False,
+                               "data": [values.get(day) for day in days]})
+            ui.echart({"tooltip": {"trigger": "axis"},
+                       "legend": {"type": "scroll", "top": 0, "bottom": "auto"},
+                       "xAxis": {"type": "category", "data": days},
+                       "yAxis": {"type": "value", "scale": True}, "series": series,
+                       "dataZoom": [{"type": "inside"}, {"type": "slider", "bottom": 5}],
+                       "grid": {"left": 60, "right": 30, "bottom": 80}}).classes("w-full h-96")
+            ui.button("关闭", on_click=comparison_dialog.close).props("flat")
+        comparison_dialog.open()
 
     def request_delete_history(run_id: str) -> None:
         with ui.dialog() as dialog, ui.card():
@@ -1679,6 +1850,7 @@ def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
         with ui.card().classes("w-full border border-slate-200 shadow-none"):
             with ui.row().classes("w-full items-center justify-between gap-3"):
                 ui.label("回测任务历史").classes("text-lg font-semibold")
+                ui.button("对比所选实验", icon="compare_arrows", on_click=compare_selected).props("outline")
                 ui.button(
                     "清理已结束记录",
                     on_click=request_clear_history,
@@ -1702,6 +1874,7 @@ def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
                 def view_report(run_id: str) -> None:
                     model.select_report(run_id)
                     status_panel.refresh()
+                    sections.set_value(result_tab)
 
                 def change_page(page: int) -> None:
                     model.set_history_page(page)
@@ -1732,6 +1905,9 @@ def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
             }
             for item in state.history:
                 with ui.row().classes("w-full items-center gap-4 border-t border-slate-100 pt-3"):
+                    if item.has_report:
+                        comparison_selected.setdefault(item.run_id, False)
+                        ui.checkbox("对比").bind_value(comparison_selected, item.run_id)
                     with ui.column().classes("gap-1 grow"):
                         with ui.row().classes("items-center gap-3"):
                             ui.label(item.run_id).classes("text-xs font-mono text-slate-500")
@@ -1758,6 +1934,10 @@ def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
                     ).props("flat")
                     if not item.has_report:
                         view_button.disable()
+                    else:
+                        ui.button("载入配置", icon="replay", on_click=lambda run_id=item.run_id: guard.navigate(
+                            "/backtests?" + urlencode({"source_run": run_id})
+                        )).props("flat")
                     delete_button = ui.button(
                         "清理",
                         on_click=lambda _, run_id=item.run_id: request_delete_history(run_id),
@@ -2042,13 +2222,16 @@ def render_strategy_lab_page(model: StrategyLabPageModel | None) -> None:
         status_panel.refresh()
         history_panel.refresh()
         if state.active_task is not None and state.active_task.status in _TERMINAL_STATUSES:
-            try:
-                model.acknowledge(state.active_task)
-            except Exception:
-                pass
+            # Keep the terminal task attached so the asynchronous panel refresh
+            # can still display its result or failure. start() replaces it safely.
             refresh_readiness()
             poll_timer.deactivate()
 
     poll_timer: Timer = ui.timer(1.0, poll, active=False)
-    history_panel()
-    status_panel()
+    with history_container:
+        history_panel()
+    with result_panel:
+        status_panel()
+    if initial_state.active_task is not None and initial_state.active_task.status not in _TERMINAL_STATUSES:
+        sections.set_value(result_tab)
+        poll_timer.activate()

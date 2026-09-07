@@ -7,6 +7,8 @@ from decimal import Decimal
 from typing import Protocol
 
 from nicegui import ui
+from compass.ui.navigation import account_url
+from compass.ui.edit_guard import EditGuard
 
 from compass.domain.market import InstrumentId
 from compass.domain.trading import AccountSnapshot, Position
@@ -141,6 +143,10 @@ class AccountOverviewPageModel:
             raise TypeError("today must be callable")
         self._gateway = gateway
         self._today = today
+
+    @property
+    def account_id(self) -> str:
+        return self._gateway.active_account_profile().account_id
 
     def select_account(self, account_id: str) -> SignalAccountProfile:
         return self._gateway.select_account(account_id)
@@ -617,6 +623,7 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
         ui.label("账户总览服务尚未配置").classes("text-negative")
         return
     state = model.state()
+    guard = EditGuard()
     profile_options = {item.account_id: item.name for item in state.profiles}
     profile_by_id = {item.account_id: item for item in state.profiles}
     instrument_by_code = {str(item.instrument): item for item in state.instruments}
@@ -641,9 +648,8 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
         ]
     )
 
-    def switch_account(account_id: object) -> None:
-        model.select_account(str(account_id))
-        ui.navigate.reload()
+    async def switch_account(account_id: object) -> None:
+        await guard.navigate(account_url("/account", str(account_id)))
 
     with ui.row().classes("w-full items-end justify-between gap-3"):
         with ui.column().classes("gap-0"):
@@ -684,9 +690,9 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
                 holdings_mode.on_value_change(lambda _: update_holdings_source())
                 update_holdings_source()
 
-                def create_account() -> None:
+                async def create_account() -> None:
                     try:
-                        model.create_account(
+                        created = model.create_account(
                             account_name.value,
                             holdings_source.value if holdings_mode.value == "shared" else None,
                         )
@@ -694,8 +700,9 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
                         ui.notify(str(error)[:120] or "账户创建失败", type="negative")
                         return
                     create_dialog.close()
+                    await guard.clear()
                     ui.notify("账户已创建并切换", type="positive")
-                    ui.navigate.reload()
+                    ui.navigate.to(account_url("/account", created.account_id))
 
                 with ui.row().classes("w-full justify-end gap-2"):
                     ui.button("取消", on_click=create_dialog.close).props("flat")
@@ -709,15 +716,16 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
                     "text-sm text-grey-7"
                 )
 
-                def delete_account() -> None:
+                async def delete_account() -> None:
                     try:
-                        model.delete_account(state.active_profile.account_id)
+                        remaining = model.delete_account(state.active_profile.account_id)
                     except Exception as error:
                         ui.notify(str(error)[:120] or "账户删除失败", type="negative")
                         return
                     delete_dialog.close()
+                    await guard.clear()
                     ui.notify("账户方案已删除", type="positive")
-                    ui.navigate.reload()
+                    ui.navigate.to(account_url("/account", remaining.account_id))
 
                 with ui.row().classes("w-full justify-end gap-2"):
                     ui.button("取消", on_click=delete_dialog.close).props("flat")
@@ -730,6 +738,7 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
             delete_button.set_enabled(len(state.profiles) > 1)
 
     active_holdings_id = state.active_profile.holdings_account_id
+    overview_slot = ui.column().classes("w-full")
     if active_holdings_id != state.active_profile.account_id:
         source_profile = profile_by_id.get(str(active_holdings_id))
         ui.label(
@@ -737,8 +746,15 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
             "修改后，所有共享该持仓的账户都会使用最新版本。"
         ).classes("w-full text-sm text-blue-8 bg-blue-1 rounded px-3 py-2")
 
-    with ui.card().classes("w-full"):
+    with ui.expansion("编辑持仓与现金", icon="edit", value=state.latest is None).classes(
+        "w-full border border-slate-200 rounded"
+    ):
         ui.label("持仓配置").classes("text-subtitle1 font-semibold")
+        if not state.instruments:
+            ui.label("可先保存纯现金账户；添加持仓前需要同步对应标的的行情。").classes(
+                "text-sm text-slate-600"
+            )
+            ui.link("前往同步行情", "/data")
         ui.label(
             "这里维护真实持仓；共享同一持仓来源的账户方案会同步使用保存后的最新版本。"
         ).classes("text-sm text-grey-7")
@@ -764,11 +780,14 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
                     ui.input("平均成本").bind_value(row, "average_cost").props(
                         "outlined dense"
                     ).classes("w-36")
+                    def remove_position(row_index: int = index) -> None:
+                        position_rows.pop(row_index)
+                        position_editor.refresh()
+                        guard.mark()
+
                     ui.button(
                         icon="delete",
-                        on_click=lambda _, row_index=index: (
-                            position_rows.pop(row_index), position_editor.refresh()
-                        ),
+                        on_click=remove_position,
                     ).props("flat round color=negative")
 
         position_editor()
@@ -791,8 +810,9 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
                 }
             )
             position_editor.refresh()
+            guard.mark()
 
-        def save_positions() -> None:
+        async def save_positions() -> None:
             try:
                 saved = model.save_account(
                     cash_value["value"],
@@ -815,6 +835,7 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
                 else f"持仓快照 #{saved.row_id} 已保存",
                 type="positive",
             )
+            await guard.clear()
             ui.navigate.reload()
 
         def load_snapshot(record: StoredAccountSnapshot) -> None:
@@ -943,7 +964,7 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
         )
         for instrument in classified_instruments
     }
-    with ui.row().classes("w-full gap-3"):
+    with overview_slot, ui.row().classes("w-full gap-3"):
         for label, value in (
             ("账户净值", f"¥{equity:,.2f}"),
             ("现金", f"¥{cash:,.2f}"),

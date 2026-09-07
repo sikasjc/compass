@@ -385,6 +385,8 @@ def test_strategy_lab_runs_two_strategies_across_multiple_etfs(tmp_path: Path) -
 
         report = application.strategy_lab_gateway.report("backtest-test")
         assert report is not None
+        restored_configuration = application.models.backtests.report_configuration("backtest-test")
+        assert restored_configuration == configuration
         assert report.snapshot.market_rule_configuration["execution"] == "next_close"
         assert report.snapshot.instrument_pool["instruments"] == (
             str(INDEX),
@@ -1181,5 +1183,47 @@ def test_signal_execution_updates_holdings_and_marks_prior_decision_stale(
                 fees="0.00",
                 recorded_at=NOW + timedelta(minutes=3),
             )
+    finally:
+        application.shutdown()
+
+
+def test_saving_after_first_sync_does_not_backdate_cash_account(tmp_path: Path) -> None:
+    from compass.domain.trading import AccountSnapshot
+
+    application = _application(tmp_path, BacktestProvider())
+    try:
+        center = application.signal_center
+        center._accounts.save(AccountSnapshot(date(2030, 1, 1), Decimal("100000"), ()))
+        application.data_gateway.sync("akshare", date(2026, 8, 7), date(2026, 8, 7))
+        page = center.for_account("main")
+        saved = page.save_account("120000", ())
+        assert saved.snapshot.as_of == date(2030, 1, 1)
+        assert page.account_valuation_history()[-1].cash == Decimal("120000")
+    finally:
+        application.shutdown()
+
+
+def test_page_accounts_remain_bound_and_reject_stale_saves(tmp_path: Path) -> None:
+    application = _application(tmp_path, PartiallyFailingProvider())
+    try:
+        center = application.signal_center
+        main = center.for_account("main")
+        other_profile = center.create_account("独立账户")
+        other = center.for_account(other_profile.account_id)
+        # The default selection has changed; the original page must still write main.
+        saved = main.save_account("100000", ())
+        assert saved.account_id == "main"
+        assert other.latest_account() is None
+        other.save_account("50000", ())
+        stale = center.for_account("main")
+        fresh = center.for_account("main")
+        fresh.save_account("120000", ())
+        with pytest.raises(ValueError, match="其他页面更新"):
+            stale.save_account("90000", ())
+        assert center.for_account("main").latest_account().snapshot.cash == Decimal("120000")
+        assert other.latest_account().snapshot.cash == Decimal("50000")
+        center.delete_account(other_profile.account_id)
+        with pytest.raises(LookupError, match="账户已删除"):
+            other.save_account("1", ())
     finally:
         application.shutdown()

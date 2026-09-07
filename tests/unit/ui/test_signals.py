@@ -188,3 +188,32 @@ def test_only_unadopted_or_ignored_signals_are_deletable() -> None:
 def test_selected_strategy_rejects_out_of_range_budget(budget: Decimal) -> None:
     with pytest.raises(ValueError, match="strategy budget"):
         SelectedDecisionStrategy("trend-v1", budget)
+
+
+def test_signal_generation_runs_in_background_and_rejects_duplicates() -> None:
+    from threading import Event
+    from compass.services.task_manager import TaskManager, TaskConflictError, TaskStatus
+
+    entered, release = Event(), Event()
+
+    class SlowGateway(SignalGatewayStub):
+        def generate(self, *args, **kwargs):
+            entered.set()
+            assert release.wait(5)
+            return super().generate(*args, **kwargs)
+
+    gateway = SlowGateway()
+    tasks = TaskManager()
+    model = SignalPageModel(gateway, tasks)
+    try:
+        task = model.start_generation((("strategy-a", "50"),), "10", "100")
+        assert entered.wait(2)
+        assert model.generation_task().status is TaskStatus.RUNNING
+        with pytest.raises(TaskConflictError):
+            model.start_generation((("strategy-a", "50"),), "10", "100")
+        release.set()
+        assert tasks.wait(task.task_id, timeout=5).status is TaskStatus.SUCCEEDED
+        assert gateway.generated is not None
+    finally:
+        release.set()
+        tasks.shutdown()

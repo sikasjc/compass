@@ -8,6 +8,9 @@ from typing import Protocol
 
 from nicegui import ui
 from nicegui.elements.dialog import Dialog
+from compass.ui.navigation import account_url
+from compass.services.task_manager import TaskManager, TaskSnapshot, TaskStatus, TaskOperationError
+from compass.ui.task_status import task_status_label
 
 from compass.services.decision_service import (
     DecisionSide,
@@ -84,8 +87,48 @@ class SignalPageState:
 
 
 class SignalPageModel:
-    def __init__(self, gateway: SignalGateway) -> None:
+    def __init__(self, gateway: SignalGateway, tasks: TaskManager | None = None) -> None:
         self._gateway = gateway
+        self._tasks = tasks
+
+    @property
+    def account_id(self) -> str:
+        return self._gateway.active_account_profile().account_id
+
+    def generation_task(self) -> TaskSnapshot | None:
+        if self._tasks is None:
+            return None
+        name = f"signal:{self._gateway.active_account_profile().account_id}"
+        matching = [item for item in self._tasks.snapshots() if item.name == name]
+        return max(matching, key=lambda item: item.submitted_at, default=None)
+
+    def start_generation(
+        self,
+        allocations: tuple[tuple[str, object], ...],
+        cash_reserve_percent: object,
+        minimum_trade_amount: object,
+    ) -> TaskSnapshot:
+        if self._tasks is None:
+            raise ValueError("信号后台任务未配置")
+        selections, reserve, minimum = self._configuration(
+            allocations, cash_reserve_percent, minimum_trade_amount
+        )
+        def generate() -> DecisionExportRecord:
+            try:
+                return self._gateway.generate(
+                    selections, cash_reserve=reserve, minimum_trade_amount=minimum
+                )
+            except Exception as error:
+                code = str(error).split(":", 1)[0]
+                if not re.fullmatch(r"[A-Z][A-Z0-9_]*", code):
+                    code = "SIGNAL_GENERATION_FAILED"
+                raise TaskOperationError(code) from error
+
+        return self._tasks.submit(
+            f"signal:{self._gateway.active_account_profile().account_id}",
+            True,
+            generate,
+        )
 
     def state(self) -> SignalPageState:
         decisions, invalid_count = self._gateway.readable_decisions()
@@ -220,6 +263,8 @@ def _error_text(error: Exception) -> str:
     code = raw.split(":", 1)[0]
     if re.fullmatch(r"[A-Z][A-Z0-9_]*", code):
         translations = {
+            "HEAVY_TASK_ACTIVE": "已有耗时任务运行中，请等待它完成后再生成建议",
+            "SIGNAL_GENERATION_FAILED": "生成失败，请检查行情与策略设置，并到日志查看详细原因",
             "ACCOUNT_SNAPSHOT_MISSING": "请先保存当前持仓",
             "DECISION_BUDGET_EXCEEDS_AVAILABLE_CAPITAL": "策略预算与现金预留合计不能超过 100%",
             "DECISION_POOL_DATA_MISSING": "策略或持仓标的缺少本地行情，请先同步",
@@ -420,12 +465,7 @@ def render_signals_page(model: SignalPageModel | None) -> None:
         )
 
         def switch_account(account_id: object) -> None:
-            try:
-                model.select_account(str(account_id))
-            except Exception as error:
-                ui.notify(_error_text(error), type="negative")
-                return
-            ui.navigate.reload()
+            ui.navigate.to(account_url("/signals", str(account_id)))
 
         account_options = {item.account_id: item.name for item in state.account_profiles}
         with ui.row().classes("w-full items-end gap-2"):
@@ -442,10 +482,13 @@ def render_signals_page(model: SignalPageModel | None) -> None:
             ui.button(
                 "前往账户页维护",
                 icon="manage_accounts",
-                on_click=lambda: ui.navigate.to("/account"),
+                on_click=lambda: ui.navigate.to(
+                    account_url("/account", state.active_account_profile.account_id)
+                ),
             ).props("outline")
 
-    with ui.card().classes("w-full"):
+    result_slot = ui.column().classes("w-full")
+    with ui.expansion("查看当前持仓", icon="account_balance_wallet").classes("w-full"):
         ui.label(f"1. 当前持仓 · {state.active_account_profile.name}").classes(
             "text-subtitle1 font-semibold"
         )
@@ -454,7 +497,9 @@ def render_signals_page(model: SignalPageModel | None) -> None:
             ui.button(
                 "配置账户持仓",
                 icon="manage_accounts",
-                on_click=lambda: ui.navigate.to("/account"),
+                on_click=lambda: ui.navigate.to(
+                    account_url("/account", state.active_account_profile.account_id)
+                ),
             ).props("outline")
         else:
             snapshot = state.account.snapshot
@@ -491,10 +536,13 @@ def render_signals_page(model: SignalPageModel | None) -> None:
             else:
                 ui.label("当前为空仓").classes("text-sm text-grey-6")
 
-    with ui.card().classes("w-full"):
+    with ui.expansion(
+        "策略配置与生成建议", icon="tune", value=state.latest_decision is None
+    ).classes("w-full border border-slate-200 rounded"):
         ui.label("2. 选择策略并生成最新收盘信号").classes("text-subtitle1 font-semibold")
         if not state.strategies:
             ui.label("暂无启用的已保存策略，请先到策略实验室创建策略模板。")
+            ui.link("前往创建策略", "/strategies")
         for strategy in state.strategies:
             row = strategy_rows[strategy.instance_id]
             with ui.row().classes("w-full items-center gap-3"):
@@ -536,7 +584,7 @@ def render_signals_page(model: SignalPageModel | None) -> None:
 
             def generate_signal() -> None:
                 try:
-                    record = model.generate(
+                    model.start_generation(
                         selected_allocations(),
                         parameters["reserve"],
                         parameters["minimum"],
@@ -544,18 +592,20 @@ def render_signals_page(model: SignalPageModel | None) -> None:
                 except Exception as error:
                     ui.notify(_error_text(error), type="negative")
                     return
-                selected_decision["record"] = record
-                ui.notify("最新收盘信号与调仓建议已生成", type="positive")
-                ui.navigate.reload()
+                generation_button.disable()
+                generation_status.set_text("正在生成建议，可继续浏览本页，完成后结果将自动更新。")
 
             ui.button(
                 "保存策略设置",
                 icon="save",
                 on_click=save_strategy_configuration,
             ).props("outline").set_enabled(bool(state.strategies))
-            ui.button("生成调仓建议", icon="auto_graph", on_click=generate_signal).props(
+            generation_button = ui.button(
+                "生成调仓建议", icon="auto_graph", on_click=generate_signal
+            ).props(
                 "color=primary"
             ).set_enabled(state.account is not None and bool(state.strategies))
+        generation_status = ui.label("").classes("text-sm text-slate-600")
 
     @ui.refreshable
     def decision_view() -> None:
@@ -882,111 +932,148 @@ def render_signals_page(model: SignalPageModel | None) -> None:
                         "flat"
                     )
 
-    decision_view()
+    with result_slot:
+        decision_view()
 
-    with ui.card().classes("w-full"):
-        with ui.row().classes("w-full items-center justify-between"):
-            ui.label("信号历史").classes("text-subtitle1 font-semibold")
-            with ui.row().classes("gap-2"):
-                if state.invalid_decision_count:
-                    with ui.dialog() as invalid_dialog, ui.card():
-                        ui.label("清理全部无效信号记录？").classes("font-semibold")
-                        ui.label(
-                            "无法恢复的信号及其执行记录会被删除；账户持仓和当前行情不会删除。"
-                        )
-
-                        def clear_invalid() -> None:
-                            try:
-                                deleted = model.clear_invalid_decisions()
-                            except Exception as error:
-                                ui.notify(_error_text(error), type="negative")
-                                return
-                            invalid_dialog.close()
-                            ui.notify(f"已清理 {deleted} 条无效信号", type="positive")
-                            ui.navigate.reload()
-
-                        with ui.row().classes("w-full justify-end gap-2"):
-                            ui.button("取消", on_click=invalid_dialog.close).props("flat")
-                            ui.button("确认清理", on_click=clear_invalid, color="negative")
-
-                    ui.button(
-                        f"清理无效记录（{state.invalid_decision_count}）",
-                        icon="cleaning_services",
-                        on_click=invalid_dialog.open,
-                    ).props("outline")
-                if state.decision_history:
-                    with ui.dialog() as clear_dialog, ui.card():
-                        ui.label("清理当前账户的全部信号历史？").classes("font-semibold")
-                        ui.label(
-                            "仅清理未采用或已忽略的信号；已执行、部分执行的信号作为审计记录永久保留。"
-                        )
-
-                        def clear_all() -> None:
-                            try:
-                                deleted = model.clear_decisions()
-                            except Exception as error:
-                                ui.notify(_error_text(error), type="negative")
-                                return
-                            clear_dialog.close()
-                            ui.notify(f"已清理 {deleted} 条信号", type="positive")
-                            ui.navigate.reload()
-
-                        with ui.row().classes("w-full justify-end gap-2"):
-                            ui.button("取消", on_click=clear_dialog.close).props("flat")
-                            ui.button("确认清理", on_click=clear_all, color="negative")
-                    ui.button(
-                        "清理全部历史",
-                        icon="delete_sweep",
-                        on_click=clear_dialog.open,
-                    ).props("flat color=negative")
-        if not state.decision_history:
-            ui.label("暂无历史记录").classes("text-sm text-grey-6")
-        for record in state.decision_history[:20]:
+    @ui.refreshable
+    def history_view() -> None:
+        state = model.state()
+        with ui.card().classes("w-full"):
             with ui.row().classes("w-full items-center justify-between"):
-                ui.label(
-                    f"{record.result.decision_date.isoformat()} · {record.decision_id} · "
-                    f"建议 {len(record.result.recommendations)} 个标的"
-                ).classes("text-sm")
+                ui.label("信号历史").classes("text-subtitle1 font-semibold")
+                with ui.row().classes("gap-2"):
+                    if state.invalid_decision_count:
+                        with ui.dialog() as invalid_dialog, ui.card():
+                            ui.label("清理全部无效信号记录？").classes("font-semibold")
+                            ui.label(
+                                "无法恢复的信号及其执行记录会被删除；账户持仓和当前行情不会删除。"
+                            )
 
-                def show_history(decision_id: str = record.decision_id) -> None:
-                    loaded = model.decision(decision_id)
-                    if loaded is not None:
-                        selected_decision["record"] = loaded
-                        selected_comparison["result"] = None
-                        decision_view.refresh()
+                            def clear_invalid() -> None:
+                                try:
+                                    deleted = model.clear_invalid_decisions()
+                                except Exception as error:
+                                    ui.notify(_error_text(error), type="negative")
+                                    return
+                                invalid_dialog.close()
+                                ui.notify(f"已清理 {deleted} 条无效信号", type="positive")
+                                ui.navigate.reload()
 
-                ui.button(icon="visibility", on_click=show_history).props("flat round")
+                            with ui.row().classes("w-full justify-end gap-2"):
+                                ui.button("取消", on_click=invalid_dialog.close).props("flat")
+                                ui.button("确认清理", on_click=clear_invalid, color="negative")
 
-                history_execution = model.execution(record.decision_id)
-                if not _decision_deletable(
-                    None if history_execution is None else history_execution.status
-                ):
-                    ui.icon("verified", color="positive").tooltip(
-                        "已采用的信号属于账户执行审计，不允许清理"
+                        ui.button(
+                            f"清理无效记录（{state.invalid_decision_count}）",
+                            icon="cleaning_services",
+                            on_click=invalid_dialog.open,
+                        ).props("outline")
+                    if state.decision_history:
+                        with ui.dialog() as clear_dialog, ui.card():
+                            ui.label("清理当前账户的全部信号历史？").classes("font-semibold")
+                            ui.label(
+                                "仅清理未采用或已忽略的信号；已执行、部分执行的信号作为审计记录永久保留。"
+                            )
+
+                            def clear_all() -> None:
+                                try:
+                                    deleted = model.clear_decisions()
+                                except Exception as error:
+                                    ui.notify(_error_text(error), type="negative")
+                                    return
+                                clear_dialog.close()
+                                ui.notify(f"已清理 {deleted} 条信号", type="positive")
+                                ui.navigate.reload()
+
+                            with ui.row().classes("w-full justify-end gap-2"):
+                                ui.button("取消", on_click=clear_dialog.close).props("flat")
+                                ui.button("确认清理", on_click=clear_all, color="negative")
+                        ui.button(
+                            "清理全部历史",
+                            icon="delete_sweep",
+                            on_click=clear_dialog.open,
+                        ).props("flat color=negative")
+            if not state.decision_history:
+                ui.label("暂无历史记录").classes("text-sm text-grey-6")
+            for record in state.decision_history[:20]:
+                with ui.row().classes("w-full items-center justify-between"):
+                    ui.label(
+                        f"{record.result.decision_date.isoformat()} · {record.decision_id} · "
+                        f"建议 {len(record.result.recommendations)} 个标的"
+                    ).classes("text-sm")
+
+                    def show_history(decision_id: str = record.decision_id) -> None:
+                        loaded = model.decision(decision_id)
+                        if loaded is not None:
+                            selected_decision["record"] = loaded
+                            selected_comparison["result"] = None
+                            decision_view.refresh()
+
+                    ui.button(icon="visibility", on_click=show_history).props("flat round")
+
+                    history_execution = model.execution(record.decision_id)
+                    if not _decision_deletable(
+                        None if history_execution is None else history_execution.status
+                    ):
+                        ui.icon("verified", color="positive").tooltip(
+                            "已采用的信号属于账户执行审计，不允许清理"
+                        )
+                        continue
+
+                    with ui.dialog() as delete_dialog, ui.card():
+                        ui.label("清理这条未采用信号？").classes("font-semibold")
+                        ui.label("信号和关联执行记录会被删除；账户持仓快照不会删除。")
+
+                        def delete_history(
+                            decision_id: str = record.decision_id,
+                            dialog: Dialog = delete_dialog,
+                        ) -> None:
+                            try:
+                                model.delete_decision(decision_id)
+                            except Exception as error:
+                                ui.notify(_error_text(error), type="negative")
+                                return
+                            dialog.close()
+                            ui.notify("信号历史已清理", type="positive")
+                            ui.navigate.reload()
+
+                        with ui.row().classes("w-full justify-end gap-2"):
+                            ui.button("取消", on_click=delete_dialog.close).props("flat")
+                            ui.button("确认清理", on_click=delete_history, color="negative")
+
+                    ui.button(icon="delete_outline", on_click=delete_dialog.open).props(
+                        "flat round color=negative aria-label=清理该信号"
                     )
-                    continue
 
-                with ui.dialog() as delete_dialog, ui.card():
-                    ui.label("清理这条未采用信号？").classes("font-semibold")
-                    ui.label("信号和关联执行记录会被删除；账户持仓快照不会删除。")
+    history_view()
+    initial_task = model.generation_task()
+    seen_task = [None if initial_task is None else (
+        initial_task.task_id if initial_task.status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED} else None
+    )]
 
-                    def delete_history(
-                        decision_id: str = record.decision_id,
-                        dialog: Dialog = delete_dialog,
-                    ) -> None:
-                        try:
-                            model.delete_decision(decision_id)
-                        except Exception as error:
-                            ui.notify(_error_text(error), type="negative")
-                            return
-                        dialog.close()
-                        ui.notify("信号历史已清理", type="positive")
-                        ui.navigate.reload()
+    def poll_generation() -> None:
+        task = model.generation_task()
+        if task is None:
+            return
+        active = task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}
+        generation_button.set_enabled(
+            not active and state.account is not None and bool(state.strategies)
+        )
+        elapsed = ((task.completed_at or datetime.now().astimezone()) - task.submitted_at).total_seconds()
+        generation_status.set_text(f"信号任务：{task_status_label(task.status)} · {elapsed:.0f} 秒")
+        if task.status is TaskStatus.FAILED:
+            code = task.failure.code if task.failure else "SIGNAL_GENERATION_FAILED"
+            detail = f" · 日志编号 {task.failure.error_id}" if task.failure else ""
+            generation_status.set_text(f"生成失败：{_error_text(ValueError(code))}{detail}")
+        if active or seen_task[0] == task.task_id:
+            return
+        seen_task[0] = task.task_id
+        if task.status is TaskStatus.SUCCEEDED:
+            selected_decision["record"] = model.state().latest_decision
+            selected_comparison["result"] = None
+            decision_view.refresh()
+            history_view.refresh()
+            ui.notify("调仓建议已生成", type="positive")
 
-                    with ui.row().classes("w-full justify-end gap-2"):
-                        ui.button("取消", on_click=delete_dialog.close).props("flat")
-                        ui.button("确认清理", on_click=delete_history, color="negative")
-
-                ui.button(icon="delete_outline", on_click=delete_dialog.open).props(
-                    "flat round color=negative aria-label=清理该信号"
-                )
+    ui.timer(1.0, poll_generation)
+    poll_generation()

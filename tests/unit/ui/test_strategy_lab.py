@@ -57,6 +57,49 @@ def test_strategy_configuration_rejects_lookahead_prone_or_invalid_values() -> N
         replace(configuration().strategies[0], short_window=60, long_window=20)
 
 
+def test_named_research_configurations_survive_restart_and_preserve_parameters(tmp_path) -> None:
+    from compass.services.research_workspace import ResearchWorkspace
+
+    path = tmp_path / "research.json"
+    repository = ResearchWorkspace(path)
+    original = replace(
+        configuration(),
+        initial_cash_weight=Decimal("0.7"),
+        initial_positions=(StrategyLabInitialPosition(INSTRUMENT, Decimal("0.3")),),
+    )
+    saved = repository.save("研究方案", original)
+    restarted = ResearchWorkspace(path)
+    assert restarted.get(saved.key).configuration == original
+    second = restarted.save("另一组参数", replace(original, slippage_bps=Decimal("3.25")))
+    assert second.key != saved.key
+    assert len(restarted.list()) == 2
+    path.write_text(path.read_text("utf-8").replace("3.25", "9.25"), "utf-8")
+    with pytest.raises(ValueError, match="校验失败"):
+        restarted.list()
+
+
+@pytest.mark.parametrize("kind", [StrategyLabKind.KRONOS_FORECAST, StrategyLabKind.RULE_DSL])
+def test_research_storage_preserves_model_and_rule_parameters(tmp_path, kind) -> None:
+    from compass.services.research_workspace import ResearchWorkspace
+    from compass.strategies.rule_dsl import DslVariable
+
+    leg = replace(
+        configuration().strategies[0], strategy=kind,
+        kronos_parameters=(KronosForecastParameters(model_size="mini", lookback=64)
+                           if kind is StrategyLabKind.KRONOS_FORECAST else None),
+        buy_expression="close > sma(close, window)", sell_expression="close < sma(close, window)",
+        variables=(DslVariable(
+            name="window", value=Decimal("20"), minimum=Decimal("5"),
+            maximum=Decimal("100"), step=Decimal("5"),
+        ),),
+        template_instance_id="strategy-template-v1", template_name="研究模板",
+    )
+    original = replace(configuration(), strategies=(leg,))
+    repository = ResearchWorkspace(tmp_path / "research.json")
+    entry = repository.save("规则与模型配置", original)
+    assert repository.get(entry.key).configuration == original
+
+
 def test_strategy_configuration_rejects_duplicate_ids_and_excess_budget() -> None:
     first = replace(configuration().strategies[0], budget=Decimal("0.6"))
     duplicate = replace(first, instruments=(InstrumentId.parse("SZSE.159949"),))
@@ -210,3 +253,16 @@ def test_strategy_lab_model_does_not_load_latest_report_by_default() -> None:
     assert state.active_report is None
     assert gateway.latest_report_reads == 0
     assert state.templates[0].name == "双均线模板"
+
+
+def test_reopened_research_page_tracks_existing_task_without_resubmission() -> None:
+    class SharedTasks(Tasks):
+        def snapshots(self):
+            return (self.snapshot,)
+
+    tasks = SharedTasks()
+    page = StrategyLabPageModel(Gateway(), tasks)
+    assert page.state().active_task == tasks.snapshot
+    assert tasks.operation is None
+    with pytest.raises(RuntimeError, match="BACKTEST_ALREADY_RUNNING"):
+        page.start(configuration())

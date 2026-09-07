@@ -11,7 +11,7 @@ import re
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 
 from compass.domain.market import InstrumentId
 from compass.domain.trading import AccountSnapshot, Position
@@ -197,7 +197,9 @@ class AccountRepository:
     def account_id(self) -> str:
         return self._account_id
 
-    def save(self, snapshot: AccountSnapshot) -> StoredAccountSnapshot:
+    def save(
+        self, snapshot: AccountSnapshot, *, expected_row_id: int | None = -1
+    ) -> StoredAccountSnapshot:
         if type(snapshot) is not AccountSnapshot:
             raise TypeError("snapshot must be an exact AccountSnapshot")
         captured_at = _aware_datetime(self._clock(), label="captured_at")
@@ -220,12 +222,19 @@ class AccountRepository:
             equity=float_summaries[2],
         )
         with self._database.session_factory() as session:
+            # Reserve the SQLite writer before reading the version, including
+            # writes made by other repository instances or processes.
+            session.execute(text("BEGIN IMMEDIATE"))
             latest = session.scalars(
                 select(AccountSnapshotRow)
                 .where(AccountSnapshotRow.account_id == self._account_id)
                 .order_by(AccountSnapshotRow.id.desc())
                 .limit(1)
             ).first()
+            if expected_row_id != -1 and (
+                None if latest is None else latest.id
+            ) != expected_row_id:
+                raise ValueError("持仓已在其他页面更新，请刷新后重新编辑。")
             if latest is not None and latest.content_hash == snapshot_hash:
                 existing = self._record(latest)
                 if existing.snapshot != snapshot:

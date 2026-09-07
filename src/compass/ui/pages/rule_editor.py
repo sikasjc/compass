@@ -4,6 +4,9 @@ from decimal import Decimal
 from typing import Any
 
 from nicegui import ui
+from compass.ui.navigation import draft_url
+from compass.ui.edit_guard import EditGuard
+from compass.ui.condition_builder import INDICATORS, OPERATORS, build_condition
 from pydantic import ValidationError
 
 from compass.domain.market import InstrumentId
@@ -24,7 +27,12 @@ from compass.ui.pages.strategies import (
 
 def _notify_error(error: Exception, fallback: str) -> None:
     code = getattr(error, "code", fallback)
-    ui.notify(f"操作未完成：{code}", type="negative")
+    messages = {
+        "STRATEGY_DRAFT_UNKNOWN": "草稿已删除或地址失效，请从策略库重新打开。",
+        "STRATEGY_POOL_UNAVAILABLE": "标的池暂不可用，请先检查标的池与行情。",
+        "STRATEGY_DRAFT_CREATE_FAILED": "草稿未创建，请检查标的池后重试。",
+    }
+    ui.notify(messages.get(code, f"操作未完成，请检查输入或查看日志。错误编号：{code}"), type="negative")
 
 
 def render_strategy_library_page(model: StrategyPageModel | None) -> None:
@@ -48,8 +56,8 @@ def render_strategy_library_page(model: StrategyPageModel | None) -> None:
                 ui.notify("请先在标的池中启用至少一个可交易标的。", type="warning")
                 return
             try:
-                model.new_rule_draft(state.pools[0].watchlist_id)
-                ui.navigate.to("/strategies/editor")
+                created = model.new_rule_draft(state.pools[0].watchlist_id)
+                ui.navigate.to(draft_url("/strategies/editor", created.draft_id))
             except Exception as error:
                 _notify_error(error, "STRATEGY_DRAFT_CREATE_FAILED")
 
@@ -82,8 +90,7 @@ def render_strategy_library_page(model: StrategyPageModel | None) -> None:
                 actions = ui.row().classes("gap-1")
 
             def edit(selected_id: str = draft.draft_id) -> None:
-                model.select_rule_draft(selected_id)
-                ui.navigate.to("/strategies/editor")
+                ui.navigate.to(draft_url("/strategies/editor", selected_id))
 
             def remove(selected_id: str = draft.draft_id) -> None:
                 try:
@@ -99,6 +106,22 @@ def render_strategy_library_page(model: StrategyPageModel | None) -> None:
                 ui.button(icon="delete_outline", on_click=remove).props(
                     "flat round color=negative aria-label=删除草稿"
                 ).tooltip("删除")
+
+    deleted = model.deleted_rule_drafts()
+    if deleted:
+        with ui.expansion(f"草稿回收站（{len(deleted)}）", icon="restore_from_trash"):
+            for item in deleted:
+                with ui.row().classes("items-center"):
+                    ui.label(item.document.name)
+
+                    def restore(selected_id: str = item.draft_id) -> None:
+                        try:
+                            restored = model.restore_rule_draft(selected_id)
+                            ui.navigate.to(draft_url("/strategies/editor", restored.draft_id))
+                        except Exception as error:
+                            _notify_error(error, "STRATEGY_DRAFT_RESTORE_FAILED")
+
+                    ui.button("恢复", icon="restore", on_click=restore).props("outline")
 
     ui.label("已发布策略").classes("text-lg font-semibold mt-4")
     latest = tuple(
@@ -126,8 +149,8 @@ def render_strategy_library_page(model: StrategyPageModel | None) -> None:
 
             def edit_published(selected_id: str = instance.instance_id) -> None:
                 try:
-                    model.edit_rule_draft(selected_id)
-                    ui.navigate.to("/strategies/editor")
+                    created = model.edit_rule_draft(selected_id)
+                    ui.navigate.to(draft_url("/strategies/editor", created.draft_id))
                 except Exception as error:
                     _notify_error(error, "STRATEGY_RULE_EDITOR_UNSUPPORTED")
 
@@ -177,12 +200,14 @@ def render_strategy_templates_page(model: StrategyPageModel | None) -> None:
     render_strategies_page(model)
 
 
-def render_rule_editor_page(model: StrategyPageModel | None) -> None:
+def render_rule_editor_page(
+    model: StrategyPageModel | None, *, draft_id: str | None = None
+) -> None:
     if model is None:
         ui.label("策略服务未配置。")
         return
     try:
-        draft = model.active_rule_draft()
+        draft = model.active_rule_draft(draft_id) if draft_id else None
     except Exception as error:
         _notify_error(error, "STRATEGY_DRAFT_UNAVAILABLE")
         return
@@ -191,6 +216,8 @@ def render_rule_editor_page(model: StrategyPageModel | None) -> None:
         ui.button("返回策略库", on_click=lambda: ui.navigate.to("/strategies"))
         return
     document = draft.document
+    guard = EditGuard()
+    saved_draft = [draft]
     with ui.row().classes("w-full justify-between items-start gap-3"):
         with ui.column().classes("gap-1"):
             ui.label(document.name).classes("text-xl font-semibold")
@@ -198,7 +225,7 @@ def render_rule_editor_page(model: StrategyPageModel | None) -> None:
                 "text-sm text-slate-600"
             )
         ui.button(
-            "返回策略库", icon="arrow_back", on_click=lambda: ui.navigate.to("/strategies")
+            "返回策略库", icon="arrow_back", on_click=lambda: guard.navigate("/strategies")
         ).props("flat")
 
     name_input = ui.input("策略名称", value=document.name).classes("w-full")
@@ -275,6 +302,39 @@ def render_rule_editor_page(model: StrategyPageModel | None) -> None:
                     "触发条件",
                     value=rule.expression if rule is not None else "close > sma(close, 20)",
                 ).classes("w-full font-mono")
+                with ui.expansion("用表单组合条件", icon="build").classes("w-full"):
+                    with ui.row().classes("items-end gap-2"):
+                        left = ui.select(INDICATORS, value="close", label="指标")
+                        operator = ui.select(OPERATORS, value=">", label="比较方式")
+                        right = ui.select(
+                            {**INDICATORS, "number": "填写数值"},
+                            value="sma(close, 20)", label="比较对象",
+                        )
+                        number = ui.input("数值", value="0.05").bind_visibility_from(
+                            right, "value", backward=lambda value: value == "number"
+                        )
+                        combine = ui.select(
+                            {"replace": "替换当前条件", "and": "并且满足", "or": "或者满足"},
+                            value="replace", label="组合方式",
+                        )
+
+                    def apply_condition() -> None:
+                        try:
+                            condition = build_condition(
+                                str(left.value), str(operator.value),
+                                str(number.value) if right.value == "number" else str(right.value),
+                            )
+                            current = str(expression.value or "").strip()
+                            expression.set_value(
+                                f"({current}) {combine.value} ({condition})"
+                                if current and combine.value in {"and", "or"} else condition
+                            )
+                            guard.mark()
+                        except ValueError as error:
+                            ui.notify(str(error), type="negative")
+
+                    ui.button("应用条件", on_click=apply_condition).props("outline")
+                    ui.label("收益率使用小数：0.05 表示 5%。高级表达式可继续在上方编辑。").classes("text-xs text-slate-500")
                 ui.label(
                     "可用：open/high/low/close/volume/amount、sma、rsi、pct_change、"
                     "highest、lowest、cross_above、cross_below、has_position、holding_days、"
@@ -290,11 +350,14 @@ def render_rule_editor_page(model: StrategyPageModel | None) -> None:
             "expression": expression,
         }
         rule_controls.append(controls)
+        if rule is None:
+            guard.mark()
 
         def remove_rule() -> None:
             if controls in rule_controls:
                 rule_controls.remove(controls)
             card.delete()
+            guard.mark()
 
         remove_button.on_click(remove_rule)
 
@@ -354,11 +417,14 @@ def render_rule_editor_page(model: StrategyPageModel | None) -> None:
             "optimize": optimize,
         }
         variable_controls.append(controls)
+        if variable is None:
+            guard.mark()
 
         def remove_variable() -> None:
             if controls in variable_controls:
                 variable_controls.remove(controls)
             row.delete()
+            guard.mark()
 
         remove_button.on_click(remove_variable)
 
@@ -420,17 +486,36 @@ def render_rule_editor_page(model: StrategyPageModel | None) -> None:
             execute=RuleExecution(str(execution_select.value)),
         )
 
-    def save(next_page: str | None = None) -> None:
+    async def save(next_page: str | None = None, *, automatic: bool = False) -> None:
         try:
-            model.save_rule_draft(draft.draft_id, build_document())
-            ui.notify("草稿已保存", type="positive")
+            updated = build_document()
+            if updated != saved_draft[0].document:
+                saved_draft[0] = model.save_rule_draft(
+                    draft.draft_id, updated, expected=saved_draft[0]
+                )
+            await guard.clear()
+            feedback.set_text("已自动保存" if automatic else "草稿已保存")
+            feedback.classes(replace="text-sm text-emerald-700")
+            if not automatic:
+                ui.notify("草稿已保存", type="positive")
             if next_page is not None:
-                ui.navigate.to(next_page)
+                ui.navigate.to(draft_url(next_page, draft.draft_id))
         except (StrategyPageError, ValidationError, TypeError, ValueError) as error:
-            feedback.set_text(f"规则未通过验证：{getattr(error, 'code', str(error))}")
+            guard.mark()
+            feedback.classes(replace="text-sm text-red-700")
+            if isinstance(error, ValidationError):
+                details = []
+                for issue in error.errors()[:3]:
+                    location = ".".join(str(item) for item in issue["loc"]) or "策略"
+                    details.append(f"{location}：{issue['msg']}")
+                feedback.set_text("尚未保存，请修正名称、条件或动作数值。" + "；".join(details))
+            else:
+                feedback.set_text(f"尚未保存：{getattr(error, 'code', str(error))}")
+
+    ui.timer(3.0, lambda: save(automatic=True))
 
     with ui.row().classes("w-full justify-end gap-2 mt-3"):
-        ui.button("保存草稿", icon="save", on_click=save)
+        ui.button("保存草稿", icon="save", on_click=lambda: save())
         ui.button(
             "验证并预览",
             icon="query_stats",
@@ -438,11 +523,18 @@ def render_rule_editor_page(model: StrategyPageModel | None) -> None:
         ).props("color=primary")
 
 
-def render_rule_preview_page(model: StrategyPageModel | None) -> None:
+def render_rule_preview_page(
+    model: StrategyPageModel | None, *, draft_id: str | None = None
+) -> None:
     if model is None:
         ui.label("策略服务未配置。")
         return
-    draft = model.active_rule_draft()
+    try:
+        draft = model.active_rule_draft(draft_id) if draft_id else None
+    except StrategyPageError as error:
+        _notify_error(error, "STRATEGY_DRAFT_UNKNOWN")
+        ui.link("返回策略库", "/strategies")
+        return
     if draft is None:
         ui.label("没有可预览的草稿。 ")
         return
@@ -521,16 +613,27 @@ def render_rule_preview_page(model: StrategyPageModel | None) -> None:
 
     with ui.row().classes("items-end gap-3"):
         ui.button("运行预览", icon="play_arrow", on_click=run_preview).props("color=primary")
-        ui.button("返回编辑", on_click=lambda: ui.navigate.to("/strategies/editor")).props("flat")
-        ui.button("进入发布检查", on_click=lambda: ui.navigate.to("/strategies/release"))
+        ui.button("返回编辑", on_click=lambda: ui.navigate.to(
+            draft_url("/strategies/editor", draft.draft_id)
+        )).props("flat")
+        ui.button("进入发布检查", on_click=lambda: ui.navigate.to(
+            draft_url("/strategies/release", draft.draft_id)
+        ))
     run_preview()
 
 
-def render_rule_release_page(model: StrategyPageModel | None) -> None:
+def render_rule_release_page(
+    model: StrategyPageModel | None, *, draft_id: str | None = None
+) -> None:
     if model is None:
         ui.label("策略服务未配置。")
         return
-    draft = model.active_rule_draft()
+    try:
+        draft = model.active_rule_draft(draft_id) if draft_id else None
+    except StrategyPageError as error:
+        _notify_error(error, "STRATEGY_DRAFT_UNKNOWN")
+        ui.link("返回策略库", "/strategies")
+        return
     if draft is None:
         ui.label("没有可发布的草稿。 ")
         return
@@ -566,12 +669,14 @@ def render_rule_release_page(model: StrategyPageModel | None) -> None:
 
     def publish() -> None:
         try:
-            instance = model.publish_rule_draft(draft.draft_id)
+            instance = model.publish_rule_draft(draft.draft_id, expected=draft)
             ui.notify(f"已发布：{instance.name} v{instance.version}", type="positive")
             ui.navigate.to("/strategies")
         except Exception as error:
             feedback.set_text(f"发布失败：{getattr(error, 'code', 'STRATEGY_PUBLISH_FAILED')}")
 
     with ui.row().classes("w-full justify-end gap-2"):
-        ui.button("返回编辑", on_click=lambda: ui.navigate.to("/strategies/editor"))
+        ui.button("返回编辑", on_click=lambda: ui.navigate.to(
+            draft_url("/strategies/editor", draft.draft_id)
+        ))
         ui.button("发布策略版本", icon="publish", on_click=publish).props("color=primary")

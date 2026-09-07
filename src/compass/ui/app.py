@@ -4,6 +4,7 @@ import argparse
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import sys
+from datetime import date
 from typing import Protocol, cast
 
 from nicegui import app, ui
@@ -12,6 +13,7 @@ from compass.config import Settings
 from compass.services.local_application import build_local_application
 from compass.services.task_manager import TaskManager
 from compass.ui.layout import NavigationItem, page_shell
+from compass.ui.navigation import account_url
 from compass.ui.pages.account_overview import (
     AccountOverviewPageModel,
     render_account_overview_page,
@@ -103,6 +105,10 @@ class AppViewModels:
     logs: LogsPageModel | None = None
     task_manager: TaskManager | None = None
     owns_task_manager: bool = False
+    account_factory: Callable[[str | None], AccountOverviewPageModel] | None = None
+    signals_factory: Callable[[str | None], SignalPageModel] | None = None
+    latest_session: Callable[[], date] | None = None
+    backtests_factory: Callable[[], StrategyLabPageModel] | None = None
 
     def __post_init__(self) -> None:
         if type(self.owns_task_manager) is not bool:
@@ -111,7 +117,7 @@ class AppViewModels:
             raise ValueError("an owned task manager must be provided")
 
 
-PageHandler = Callable[[], None]
+PageHandler = Callable[..., None]
 
 
 class PageRegistrar(Protocol):
@@ -126,8 +132,13 @@ def register_pages(
     register = registrar or cast(PageRegistrar, ui.page)
 
     def home() -> None:
-        with page_shell("开始", "快速进入常用功能，不需要记住页面路径", NAV_ITEMS):
-            render_start_page()
+        with page_shell("工作台", "查看准备进度、账户和最新任务", NAV_ITEMS):
+            render_start_page(
+                models.watchlists,
+                models.signals_factory(None) if models.signals_factory else models.signals,
+                models.task_manager,
+                models.latest_session,
+            )
 
     def watchlists() -> None:
         with page_shell("标的池", "选择并维护唯一的关注标的池", NAV_ITEMS):
@@ -141,47 +152,66 @@ def register_pages(
         with page_shell("策略实验室", "创建、解释并管理可复用的策略定义", NAV_ITEMS):
             render_strategy_library_page(models.strategies)
 
-    def rule_editor() -> None:
+    def rule_editor(draft_id: str | None = None) -> None:
         with page_shell("规则编辑器", "使用规则与变量创建安全、可复现的策略草稿", NAV_ITEMS):
-            render_rule_editor_page(models.strategies)
+            render_rule_editor_page(models.strategies, draft_id=draft_id)
 
-    def rule_preview() -> None:
+    def rule_preview(draft_id: str | None = None) -> None:
         with page_shell("信号预览", "检查规则何时命中以及目标仓位如何变化", NAV_ITEMS):
-            render_rule_preview_page(models.strategies)
+            render_rule_preview_page(models.strategies, draft_id=draft_id)
 
-    def rule_release() -> None:
+    def rule_release(draft_id: str | None = None) -> None:
         with page_shell("验证与发布", "检查执行语义并发布不可变策略版本", NAV_ITEMS):
-            render_rule_release_page(models.strategies)
+            render_rule_release_page(models.strategies, draft_id=draft_id)
 
     def strategy_templates() -> None:
         with page_shell("内置模板与参数调优", "创建经典策略或运行参数实验", NAV_ITEMS):
             render_strategy_templates_page(models.strategies)
 
-    def backtests() -> None:
+    def backtests(configuration_key: str | None = None, source_run: str | None = None) -> None:
         with page_shell("策略回测", "配置组合与账户参数，运行回测并查看结果", NAV_ITEMS):
-            render_strategy_lab_page(models.backtests)
+            render_strategy_lab_page(
+                models.backtests_factory() if models.backtests_factory else models.backtests,
+                configuration_key=configuration_key, source_run=source_run,
+            )
 
     def settings() -> None:
         with page_shell("设置", "管理网络与行情请求参数", NAV_ITEMS):
             render_settings_page(models.settings)
 
-    def account() -> None:
+    def account(account_id: str | None = None) -> None:
         with page_shell("账户", "查看持仓、资金变化、建议采用情况与事后影响", NAV_ITEMS):
-            render_account_overview_page(models.account)
+            try:
+                model = models.account_factory(account_id) if models.account_factory else models.account
+                if model is not None and account_id is None:
+                    ui.navigate.to(account_url("/account", model.account_id))
+                    return
+                render_account_overview_page(model)
+            except LookupError:
+                ui.label("账户已删除或不可用，请重新选择账户。").classes("text-red-700")
+                ui.link("重新选择账户", "/account")
 
-    def signals() -> None:
+    def signals(account_id: str | None = None) -> None:
         with page_shell(
             "今日信号",
             "连接账户方案、共享持仓、最新收盘信号与执行记录",
             NAV_ITEMS,
         ):
-            render_signals_page(models.signals)
+            try:
+                model = models.signals_factory(account_id) if models.signals_factory else models.signals
+                if model is not None and account_id is None:
+                    ui.navigate.to(account_url("/signals", model.account_id))
+                    return
+                render_signals_page(model)
+            except LookupError:
+                ui.label("账户已删除或不可用，请重新选择账户。").classes("text-red-700")
+                ui.link("重新选择账户", "/signals")
 
     def logs() -> None:
         with page_shell("日志", "查看应用与行情请求的本地脱敏日志", NAV_ITEMS):
             render_logs_page(models.logs)
 
-    handlers = (
+    handlers: tuple[PageHandler, ...] = (
         home,
         signals,
         account,
@@ -210,6 +240,8 @@ def create_app(
         raise TypeError("settings must be an exact Settings value")
     local_application = None
     if models is None:
+        from compass.services.backup_service import BackupService
+        BackupService(settings.root).apply_pending()
         local_application = build_local_application(settings)
         view_models = local_application.models
     else:

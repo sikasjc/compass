@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Protocol, TypeVar, cast
 
 from nicegui import ui
+from compass.ui.backup_panel import render_backup_panel
 
 from compass.data.network_timeout import (
     DEFAULT_MARKET_TIMEOUT_SECONDS,
@@ -273,6 +274,7 @@ def render_settings_page(model: SettingsPageModel | None) -> None:
     feedback = ui.label("")
     connection_results: tuple[ConnectionTestResult, ...] = ()
     if model.runtime_data_dir is not None:
+        render_backup_panel(model.runtime_data_dir)
         with ui.card().classes("w-full border border-slate-200 shadow-none bg-slate-50"):
             ui.label("本地运行数据目录").classes("font-semibold")
             ui.label(str(model.runtime_data_dir)).classes(

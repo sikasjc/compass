@@ -43,14 +43,39 @@ class StrategyDraftRepository:
                 raise LookupError("STRATEGY_DRAFT_UNKNOWN")
             return value
 
-    def save(self, draft: RuleStrategyDraft) -> RuleStrategyDraft:
+    def save(
+        self, draft: RuleStrategyDraft, *, expected: RuleStrategyDraft | None = None
+    ) -> RuleStrategyDraft:
         if type(draft) is not RuleStrategyDraft:
             raise TypeError("strategy draft must be exact")
         with self._lock:
-            values = [item for item in self._read() if item.draft_id != draft.draft_id]
+            current = self._read()
+            if expected is not None and next(
+                (item for item in current if item.draft_id == draft.draft_id), None
+            ) != expected:
+                raise ValueError("草稿已在其他页面更新或删除，请重新打开后编辑。")
+            values = [item for item in current if item.draft_id != draft.draft_id]
             values.append(draft)
             self._write(tuple(values))
         return draft
+
+    def trash(self) -> StrategyDraftRepository:
+        return StrategyDraftRepository(self._path.with_suffix(".trash.json"))
+
+    def move_to_trash(self, draft_id: str) -> bool:
+        with self._lock:
+            draft = self.get(draft_id)
+            self.trash().save(draft)
+            return self.delete(draft_id)
+
+    def restore(self, draft_id: str) -> RuleStrategyDraft:
+        with self._lock:
+            if any(item.draft_id == draft_id for item in self._read()):
+                raise ValueError("同名草稿已存在，无法覆盖恢复。")
+            trash = self.trash()
+            draft = self.save(trash.get(draft_id))
+            trash.delete(draft_id)
+            return draft
 
     def delete(self, draft_id: str) -> bool:
         with self._lock:

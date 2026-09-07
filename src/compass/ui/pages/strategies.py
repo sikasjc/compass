@@ -554,8 +554,13 @@ class StrategyGateway(Protocol):
 class RuleDraftGateway(Protocol):
     def list(self) -> Sequence[RuleStrategyDraft]: ...
     def get(self, draft_id: str) -> RuleStrategyDraft: ...
-    def save(self, draft: RuleStrategyDraft) -> RuleStrategyDraft: ...
+    def save(
+        self, draft: RuleStrategyDraft, *, expected: RuleStrategyDraft | None = None
+    ) -> RuleStrategyDraft: ...
     def delete(self, draft_id: str) -> bool: ...
+    def move_to_trash(self, draft_id: str) -> bool: ...
+    def trash(self) -> RuleDraftGateway: ...
+    def restore(self, draft_id: str) -> RuleStrategyDraft: ...
     def new_draft_id(self) -> str: ...
 
 
@@ -736,8 +741,13 @@ class StrategyPageModel:
         self._active_rule_draft_id = draft.draft_id
         return draft
 
-    def active_rule_draft(self) -> RuleStrategyDraft | None:
+    def active_rule_draft(self, draft_id: str | None = None) -> RuleStrategyDraft | None:
         drafts = self.rule_drafts()
+        if draft_id is not None:
+            selected = next((item for item in drafts if item.draft_id == draft_id), None)
+            if selected is None:
+                raise StrategyPageError("STRATEGY_DRAFT_UNKNOWN")
+            return selected
         if not drafts:
             self._active_rule_draft_id = None
             return None
@@ -797,6 +807,8 @@ class StrategyPageModel:
         self,
         draft_id: str,
         document: StrategyRuleDocument,
+        *,
+        expected: RuleStrategyDraft | None = None,
     ) -> RuleStrategyDraft:
         drafts = self._drafts
         if drafts is None or self._clock is None:
@@ -810,7 +822,8 @@ class StrategyPageModel:
             updated_at=self._clock(),
             source_instance_id=existing.source_instance_id,
         )
-        saved = _boundary_call("STRATEGY_DRAFT_SAVE_FAILED", lambda: drafts.save(revised))
+        # Keep a conflict actionable instead of reducing it to a generic error code.
+        saved = drafts.save(revised, expected=expected)
         self._active_rule_draft_id = saved.draft_id
         return saved
 
@@ -818,7 +831,15 @@ class StrategyPageModel:
         drafts = self._drafts
         if drafts is None:
             raise StrategyPageError("STRATEGY_DRAFTS_UNAVAILABLE")
-        return _boundary_call("STRATEGY_DRAFT_DELETE_FAILED", lambda: drafts.delete(draft_id))
+        return _boundary_call("STRATEGY_DRAFT_DELETE_FAILED", lambda: drafts.move_to_trash(draft_id))
+
+    def deleted_rule_drafts(self) -> tuple[RuleStrategyDraft, ...]:
+        return () if self._drafts is None else tuple(self._drafts.trash().list())
+
+    def restore_rule_draft(self, draft_id: str) -> RuleStrategyDraft:
+        if self._drafts is None:
+            raise StrategyPageError("STRATEGY_DRAFTS_UNAVAILABLE")
+        return self._drafts.restore(draft_id)
 
     def rule_draft_instruments(self, draft_id: str) -> tuple[InstrumentId, ...]:
         drafts = self._drafts
@@ -833,11 +854,15 @@ class StrategyPageModel:
             raise StrategyPageError("STRATEGY_POOL_SNAPSHOT_CHANGED")
         return pool.instruments
 
-    def publish_rule_draft(self, draft_id: str) -> StrategyInstance:
+    def publish_rule_draft(
+        self, draft_id: str, *, expected: RuleStrategyDraft | None = None
+    ) -> StrategyInstance:
         drafts = self._drafts
         if drafts is None:
             raise StrategyPageError("STRATEGY_DRAFTS_UNAVAILABLE")
         draft = _boundary_call("STRATEGY_DRAFT_UNAVAILABLE", lambda: drafts.get(draft_id))
+        if expected is not None and draft != expected:
+            raise ValueError("草稿已更新，请重新打开发布检查后再发布。")
         parameters = _parameters(draft.document.compile_parameters().model_dump(mode="json"))
         strategy_draft = StrategyDraft(
             name=draft.document.name,

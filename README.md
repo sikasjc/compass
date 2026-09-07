@@ -287,6 +287,8 @@ C:\Users\<用户名>\AppData\Local\Compass
 │  ├─ signal_accounts.json         # 信号账户方案
 │  ├─ signal_executions.json       # 建议采用与执行记录
 │  ├─ strategy-drafts.json         # 未发布的自定义规则草稿
+│  ├─ strategy-drafts.trash.json   # 可恢复的已删除草稿
+│  ├─ research-configurations.json # 命名回测配置与上次运行配置
 │  └─ strategy_optimizations.json  # 策略调优实验
 ├─ reports                         # 导出或生成的报告
 └─ logs
@@ -296,6 +298,11 @@ C:\Users\<用户名>\AppData\Local\Compass
 运行数据目录不属于 Git 仓库。仓库中的 `/data`、`/reports`、`/logs` 也被 `.gitignore` 排除，但新版本默认不会再向仓库写入这些目录。
 
 ### 备份与迁移
+
+也可以在“设置 → 备份与恢复”下载经过校验的完整 ZIP，上传后安排下次启动恢复。
+恢复前的目录保留在运行数据根目录的 `.recovery/previous-<编号>`；备份输出保存在
+`.backups`。页面上传上限为 512 MiB，解压内容上限为 2 GiB。完整操作说明见
+[`docs/user-guide.md`](docs/user-guide.md)。
 
 1. 停止应用；
 2. 完整复制当前系统的数据根目录；

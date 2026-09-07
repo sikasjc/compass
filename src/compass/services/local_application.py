@@ -573,6 +573,8 @@ def build_local_application(
             id_factory=id_factory,
         )
         strategy_drafts = StrategyDraftRepository(settings.root / "data" / "strategy-drafts.json")
+        from compass.services.research_workspace import ResearchWorkspace
+        research_workspace = ResearchWorkspace(settings.root / "data" / "research-configurations.json")
 
         def preview_bars(instrument: InstrumentId) -> pd.DataFrame:
             bundle = bundles.latest()
@@ -635,9 +637,19 @@ def build_local_application(
                 preview_reader=preview_bars,
                 clock=clock,
             ),
-            backtests=StrategyLabPageModel(strategy_lab_gateway, tasks),
+            backtests=StrategyLabPageModel(strategy_lab_gateway, tasks, research_workspace),
+            backtests_factory=lambda: StrategyLabPageModel(
+                strategy_lab_gateway, tasks, research_workspace
+            ),
             account=AccountOverviewPageModel(signal_center),
-            signals=SignalPageModel(signal_center),
+            signals=SignalPageModel(signal_center, tasks),
+            account_factory=lambda account_id: AccountOverviewPageModel(
+                signal_center.for_account(account_id)
+            ),
+            signals_factory=lambda account_id: SignalPageModel(
+                signal_center.for_account(account_id), tasks
+            ),
+            latest_session=lambda: exchange_calendar.latest_completed_session(clock()),
             settings=SettingsPageModel(settings_gateway, settings.root),
             logs=LogsPageModel(settings_gateway),
             task_manager=tasks,

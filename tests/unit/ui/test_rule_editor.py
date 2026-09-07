@@ -123,3 +123,18 @@ def test_rule_editor_saves_revised_document_without_publishing(tmp_path: Path) -
 
     assert saved.document.name == "新版趋势策略"
     assert gateway.created is None
+
+
+def test_draft_url_selection_and_publish_check_are_independent_of_other_pages(tmp_path: Path) -> None:
+    import pytest
+
+    page, gateway = model(tmp_path)
+    first = page.new_rule_draft("main")
+    second = page.new_rule_draft("main")
+    assert page.active_rule_draft(first.draft_id) == first
+    assert page.active_rule_draft(second.draft_id) == second
+    page.save_rule_draft(first.draft_id, default_rule_document("另一页的修改"), expected=first)
+    with pytest.raises(ValueError, match="草稿已更新"):
+        page.publish_rule_draft(first.draft_id, expected=first)
+    assert gateway.created is None
+    assert page.active_rule_draft(second.draft_id) == second
