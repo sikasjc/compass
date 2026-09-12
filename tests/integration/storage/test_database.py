@@ -20,6 +20,7 @@ def test_create_schema_creates_all_persistence_tables(tmp_path: Path) -> None:
 
     assert set(inspect(database.engine).get_table_names()) == {
         "account_snapshots",
+        "signal_execution_registry",
         "backtest_reports",
         "strategy_instances",
         "watchlists",

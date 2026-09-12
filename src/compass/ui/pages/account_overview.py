@@ -148,6 +148,10 @@ class AccountOverviewPageModel:
     def account_id(self) -> str:
         return self._gateway.active_account_profile().account_id
 
+    @property
+    def account_name(self) -> str:
+        return self._gateway.active_account_profile().name
+
     def select_account(self, account_id: str) -> SignalAccountProfile:
         return self._gateway.select_account(account_id)
 
@@ -623,7 +627,7 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
         ui.label("账户总览服务尚未配置").classes("text-negative")
         return
     state = model.state()
-    guard = EditGuard()
+    guard = EditGuard(scope=".compass-holdings-form")
     profile_options = {item.account_id: item.name for item in state.profiles}
     profile_by_id = {item.account_id: item for item in state.profiles}
     instrument_by_code = {str(item.instrument): item for item in state.instruments}
@@ -649,7 +653,10 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
     )
 
     async def switch_account(account_id: object) -> None:
-        await guard.navigate(account_url("/account", str(account_id)))
+        if account_id == state.active_profile.account_id:
+            return
+        if not await guard.navigate(account_url("/account", str(account_id))):
+            selector.set_value(state.active_profile.account_id)
 
     with ui.row().classes("w-full items-end justify-between gap-3"):
         with ui.column().classes("gap-0"):
@@ -691,6 +698,8 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
                 update_holdings_source()
 
                 async def create_account() -> None:
+                    if not await guard.confirm_leave():
+                        return
                     try:
                         created = model.create_account(
                             account_name.value,
@@ -717,6 +726,8 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
                 )
 
                 async def delete_account() -> None:
+                    if not await guard.confirm_leave():
+                        return
                     try:
                         remaining = model.delete_account(state.active_profile.account_id)
                     except Exception as error:
@@ -747,7 +758,7 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
         ).classes("w-full text-sm text-blue-8 bg-blue-1 rounded px-3 py-2")
 
     with ui.expansion("编辑持仓与现金", icon="edit", value=state.latest is None).classes(
-        "w-full border border-slate-200 rounded"
+        "w-full border border-slate-200 rounded compass-holdings-form"
     ):
         ui.label("持仓配置").classes("text-subtitle1 font-semibold")
         if not state.instruments:
@@ -838,7 +849,9 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
             await guard.clear()
             ui.navigate.reload()
 
-        def load_snapshot(record: StoredAccountSnapshot) -> None:
+        async def load_snapshot(record: StoredAccountSnapshot) -> None:
+            if not await guard.confirm_leave():
+                return
             missing = tuple(
                 str(item.instrument)
                 for item in record.snapshot.positions
@@ -863,6 +876,7 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
             )
             history_dialog.close()
             position_editor.refresh()
+            guard.mark()
             ui.notify(f"已载入快照 #{record.row_id}，保存后才会生成新版本", type="positive")
 
         with ui.dialog() as history_dialog, ui.card().classes("w-[900px] max-w-[95vw]"):
@@ -1170,7 +1184,7 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
                         ui.button(
                             "去生成今日信号",
                             icon="arrow_forward",
-                            on_click=lambda: ui.navigate.to("/signals"),
+                            on_click=lambda: guard.navigate("/signals"),
                         ).props("flat")
                 elif any(item.status == "pending" for item in shadow.executions):
                     with ui.row().classes(
@@ -1180,7 +1194,7 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
                         ui.button(
                             "去同步行情",
                             icon="sync",
-                            on_click=lambda: ui.navigate.to("/data"),
+                            on_click=lambda: guard.navigate("/data"),
                         ).props("flat")
                 else:
                     ui.label("已按最新本地行情完成模拟计算。").classes(
@@ -1365,5 +1379,5 @@ def render_account_overview_page(model: AccountOverviewPageModel | None) -> None
             ui.button(
                 "去策略回测",
                 icon="query_stats",
-                on_click=lambda: ui.navigate.to("/backtests"),
+                on_click=lambda: guard.navigate("/backtests"),
             ).props("outline")

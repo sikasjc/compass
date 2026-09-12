@@ -266,3 +266,47 @@ def test_reopened_research_page_tracks_existing_task_without_resubmission() -> N
     assert tasks.operation is None
     with pytest.raises(RuntimeError, match="BACKTEST_ALREADY_RUNNING"):
         page.start(configuration())
+
+
+def test_configuration_update_save_as_delete_and_recovery(tmp_path):
+    from compass.services.research_workspace import ResearchWorkspace
+    path = tmp_path / "research.json"
+    workspace = ResearchWorkspace(path)
+    first = workspace.save("研究", configuration())
+    changed = replace(configuration(), slippage_bps=Decimal("3"))
+    workspace.save("研究改名", changed, key=first.key)
+    assert len(workspace.list()) == 1
+    assert workspace.get(first.key).configuration == changed
+    with pytest.raises(ValueError, match="同名"):
+        workspace.save("研究改名", configuration())
+    second = workspace.save("另一份", configuration())
+    assert len(workspace.list()) == 2
+    workspace.delete(second.key)
+    assert workspace.list()[0].key == first.key
+    with pytest.raises(ValueError, match="无需重建"):
+        workspace.reset_corrupt()
+    path.write_text("{broken", "utf-8")
+    backup = workspace.reset_corrupt()
+    assert backup.read_text("utf-8") == "{broken"
+    assert workspace.list() == ()
+    workspace.save("重建", configuration())
+    assert len(workspace.list()) == 1
+
+
+def test_corrupt_configuration_does_not_abort_backtest_render(tmp_path):
+    from nicegui import ui
+    from compass.services.research_workspace import ResearchWorkspace
+    from compass.ui.pages.strategy_lab import render_strategy_lab_page
+
+    path = tmp_path / "research.json"
+    path.write_text("{broken", "utf-8")
+    model = StrategyLabPageModel(Gateway(), Tasks(), workspace=ResearchWorkspace(path))
+    with ui.column() as container:
+        render_strategy_lab_page(model, configuration_key="saved-by-old-link")
+    elements = list(container.descendants())
+    texts = [getattr(item, "text", "") for item in elements]
+    assert any("已保存配置暂不可用" in text for text in texts)
+    assert "运行回测" in texts
+    assert "保留损坏文件并重建列表" in texts
+    container.delete()
+    assert path.read_text("utf-8") == "{broken"

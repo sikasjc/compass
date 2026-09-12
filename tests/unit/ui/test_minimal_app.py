@@ -20,7 +20,9 @@ from compass.ui.pages.watchlists import (
     WatchlistEntry,
     WatchlistFormModel,
     WatchlistPageModel,
+    WatchlistPageState,
 )
+from compass.ui.pages.home import _market_readiness
 
 
 NOW = datetime(2026, 8, 9, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -102,6 +104,24 @@ def test_watchlist_state_includes_current_market_data_ranges() -> None:
     model = WatchlistPageModel(gateway, lambda: (expected,))
 
     assert model.state().data_ranges == (expected,)
+
+
+def test_workbench_market_readiness_uses_the_complete_watchlist_ranges() -> None:
+    second = InstrumentId.parse("SSE.000300")
+    completed = date(2026, 9, 11)
+    state = WatchlistPageState(
+        WatchlistEntry("primary", "关注标的", (second, InstrumentId.parse("SSE.510300")), True),
+        (
+            WatchlistDataRange(second, date(2024, 9, 11), completed),
+            WatchlistDataRange(
+                InstrumentId.parse("SSE.510300"),
+                date(2024, 9, 11),
+                completed,
+            ),
+        ),
+    )
+
+    assert _market_readiness(state, completed) == (completed, True)
 
 
 def test_watchlist_can_retry_one_instrument() -> None:

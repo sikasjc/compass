@@ -85,3 +85,54 @@ def test_staged_corruption_does_not_replace_current_data(tmp_path: Path) -> None
     assert (tmp_path / "reports/report.json").read_text("utf-8") == "original-report"
     service.cancel_pending()
     assert service.apply_pending() is False
+
+
+def test_oversize_archive_is_not_offered_and_leaves_no_partial_backup(tmp_path, monkeypatch):
+    import compass.services.backup_service as module
+    service = runtime(tmp_path)
+    monkeypatch.setattr(module, "MAX_ARCHIVE_BYTES", 100)
+    with pytest.raises(ValueError, match="512 MiB"):
+        service.create()
+    assert list((tmp_path / ".backups").glob("*.zip")) == []
+
+
+def test_backup_compression_does_not_hold_sqlite_writer(tmp_path, monkeypatch):
+    import compass.services.backup_service as module
+
+    service = runtime(tmp_path)
+    original = module.shutil.copyfileobj
+    wrote = False
+
+    def copy_after_edit(source, target, length=0):
+        nonlocal wrote
+        if not wrote:
+            with closing(sqlite3.connect(tmp_path / "data/compass.db", timeout=0.1)) as database:
+                database.execute("UPDATE example SET value='new'")
+                database.commit()
+            wrote = True
+        return original(source, target, length)
+
+    monkeypatch.setattr(module.shutil, "copyfileobj", copy_after_edit)
+    archive = service.create()
+    service.stage(archive)
+    staged = next(service.recovery.glob("staged-*"))
+    with closing(sqlite3.connect(staged / "data/compass.db")) as database:
+        assert database.execute("SELECT value FROM example").fetchone() == ("original",)
+    service.cancel_pending()
+    assert not staged.exists()
+    with closing(sqlite3.connect(tmp_path / "data/compass.db")) as database:
+        assert database.execute("SELECT value FROM example").fetchone() == ("new",)
+
+
+def test_failed_stage_cleans_files_and_retention_keeps_latest_five(tmp_path, monkeypatch):
+    service = runtime(tmp_path)
+    archives = [service.create() for _ in range(6)]
+    assert service.prune_backups() == 1
+    assert len(list((tmp_path / ".backups").glob("*.zip"))) == 5
+    def fail(*args):
+        raise OSError("failed marker write")
+    monkeypatch.setattr(os, "link", fail)
+    with pytest.raises(OSError):
+        service.stage(archives[-1])
+    assert list(service.recovery.glob("staged-*")) == []
+    assert not (service.recovery / "pending.json").exists()

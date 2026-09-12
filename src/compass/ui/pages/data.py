@@ -606,6 +606,7 @@ class DataPageState:
     sync_history_total_pages: int = 1
     sync_history_total_items: int = 0
     watchlist_instruments: tuple[InstrumentId, ...] = ()
+    latest_completed_session: date | None = None
 
     def __post_init__(self) -> None:
         sources = tuple(self.sources)
@@ -661,6 +662,11 @@ class DataPageState:
         object.__setattr__(self, "previews", previews)
         object.__setattr__(self, "sync_history", history)
         object.__setattr__(self, "watchlist_instruments", watchlist_instruments)
+        if (
+            self.latest_completed_session is not None
+            and type(self.latest_completed_session) is not date
+        ):
+            raise TypeError("latest completed session must be an exact date or None")
 
     @property
     def missing_instruments(self) -> tuple[InstrumentId, ...]:
@@ -705,9 +711,15 @@ class TaskGateway(Protocol):
 
 
 class DataPageModel:
-    def __init__(self, gateway: DataGateway, tasks: TaskGateway) -> None:
+    def __init__(
+        self,
+        gateway: DataGateway,
+        tasks: TaskGateway,
+        latest_completed_session: Callable[[], date] | None = None,
+    ) -> None:
         self._gateway = gateway
         self._tasks = tasks
+        self._latest_completed_session = latest_completed_session
         self._active_sync_id: str | None = None
         self._active_sync_provider: str | None = None
         self._active_sync_cancel: Event | None = None
@@ -740,6 +752,14 @@ class DataPageModel:
             "DATA_WATCHLIST_UNAVAILABLE",
             self._watchlist_instruments,
         )
+        latest_completed_session = _boundary_call(
+            "DATA_STATUS_UNAVAILABLE",
+            lambda: (
+                self._latest_completed_session()
+                if self._latest_completed_session is not None
+                else None
+            ),
+        )
         return _boundary_call(
             "DATA_STATUS_UNAVAILABLE",
             lambda: DataPageState(
@@ -752,6 +772,7 @@ class DataPageModel:
                 history_page.total_pages,
                 history_page.total_items,
                 watchlist_instruments,
+                latest_completed_session,
             ),
         )
 
@@ -985,6 +1006,27 @@ def render_data_page(model: DataPageModel | None) -> None:
             return
         source_names = {source.provider: source.source_name for source in state.sources}
         missing_instruments = state.missing_instruments
+        outdated_previews = tuple(
+            preview
+            for preview in state.previews
+            if state.latest_completed_session is not None
+            and date.fromisoformat(preview.last_day) < state.latest_completed_session
+        )
+        source_choices = {source.provider: source.source_name for source in state.sources}
+        if selected_source_provider not in source_choices:
+            selected_source_provider = (
+                "tencent"
+                if "tencent" in source_choices
+                else next(iter(source_choices), None)
+            )
+        selected_source = next(
+            (
+                source
+                for source in state.sources
+                if source.provider == selected_source_provider
+            ),
+            None,
+        )
 
         with ui.row().classes("w-full gap-4 rounded border border-slate-200 bg-white px-4 py-3"):
             ui.label(f"关注标的 {len(state.watchlist_instruments)} 个").classes(
@@ -997,6 +1039,112 @@ def render_data_page(model: DataPageModel | None) -> None:
                 "text-sm font-medium "
                 + ("text-amber-700" if missing_instruments else "text-slate-500")
             )
+            ui.label(f"未到最新交易日 {len(outdated_previews)} 个").classes(
+                "text-sm font-medium "
+                + ("text-amber-700" if outdated_previews else "text-slate-500")
+            )
+
+        def sync(
+            targets: tuple[InstrumentId, ...] | None = None,
+            *,
+            only_missing: bool = False,
+        ) -> None:
+            if selected_source is None:
+                ui.notify("尚未配置可用的行情数据源。", type="negative")
+                return
+            validation = DataSyncRangeForm(
+                selected_range_mode,
+                selected_start_text,
+                selected_end_text,
+            ).validate()
+            range_errors.clear()
+            if validation.errors:
+                with range_errors:
+                    for message in validation.errors.values():
+                        ui.label(message).classes("text-sm text-red-700")
+                return
+            assert validation.date_range is not None
+            if only_missing:
+                try:
+                    targets = model.state().missing_instruments
+                except Exception:
+                    ui.notify("无法读取最新标的池，请刷新页面后重试。", type="negative")
+                    return
+                if not targets:
+                    ui.notify("当前没有缺失行情的标的。", type="info")
+                    content.refresh()
+                    return
+            try:
+                model.start_sync(
+                    selected_source.provider,
+                    validation.date_range,
+                    targets,
+                )
+            except Exception as error:
+                error_code = getattr(error, "code", None)
+                if error_code == "SYNC_TARGET_INVALID" or (
+                    isinstance(error, ValueError)
+                    and str(error) == "SYNC_TARGET_INVALID"
+                ):
+                    ui.notify(
+                        "标的池已经变化，已刷新页面，请重新选择后同步。",
+                        type="warning",
+                    )
+                    content.refresh()
+                elif error_code == "DATA_SYNC_SUBMISSION_FAILED" or (
+                    isinstance(error, ValueError)
+                    and str(error) == "DATA_SYNC_ALREADY_ACTIVE"
+                ):
+                    ui.notify("已有行情任务进行中，请稍后重试。", type="warning")
+                    content.refresh()
+                else:
+                    ui.notify(
+                        "同步未启动，请检查任务状态或本地日志。",
+                        type="negative",
+                    )
+            else:
+                poll_timer.activate()
+                content.refresh()
+
+        with ui.card().classes(
+            "w-full border border-emerald-200 bg-emerald-50 shadow-none"
+        ):
+            with ui.row().classes("w-full items-center justify-between gap-3 flex-wrap"):
+                with ui.column().classes("gap-1"):
+                    ui.label("同步最新行情").classes("text-lg font-semibold")
+                    ui.label(
+                        "按下方选择的区间和数据源增量同步，并自动截止到最新完整交易日。"
+                    ).classes("text-sm text-slate-600")
+                with ui.row().classes("gap-2 flex-wrap"):
+                    retry_outdated_button = ui.button(
+                        f"重试未更新标的（{len(outdated_previews)}）",
+                        on_click=lambda: sync(
+                            tuple(item.instrument for item in outdated_previews)
+                        ),
+                        icon="refresh",
+                    ).props("outline aria-label=重试未更新行情")
+                    quick_sync_button = ui.button(
+                        "立即增量同步全部",
+                        on_click=lambda: sync(),
+                        icon="sync",
+                    ).props("aria-label=顶部同步全部行情 color=primary")
+                    unavailable = (
+                        selected_source is None
+                        or not selected_source.available
+                        or state.active_sync is not None
+                        or not state.watchlist_instruments
+                    )
+                    if unavailable or not outdated_previews:
+                        retry_outdated_button.disable()
+                    if unavailable:
+                        quick_sync_button.disable()
+            if outdated_previews and state.latest_completed_session is not None:
+                ui.label(
+                    f"仍有 {len(outdated_previews)} 个标的未更新到 "
+                    f"{state.latest_completed_session}："
+                    + "、".join(item.display_label for item in outdated_previews)
+                    + "。全部追平后，开始页才会显示行情准备完成。"
+                ).classes("text-sm text-amber-800")
 
         def source_display_name(provider: str) -> str:
             return source_names.get(provider, "未知来源")
@@ -1085,7 +1233,7 @@ def render_data_page(model: DataPageModel | None) -> None:
                     "text-sm text-red-700"
                 )
         if state.latest_bundle_manifest_id is not None:
-            latest_day = max(
+            latest_day = min(
                 (preview.last_day for preview in state.previews),
                 default="暂无数据",
             )
@@ -1093,7 +1241,7 @@ def render_data_page(model: DataPageModel | None) -> None:
             with ui.column().classes("w-full gap-1 bg-slate-100 rounded px-3 py-2"):
                 ui.label(
                     f"当前行情数据：{len(state.previews)} 个标的，"
-                    f"更新至 {latest_day} · 数据版本 {short_version}"
+                    f"整体更新至 {latest_day} · 数据版本 {short_version}"
                 ).classes("text-sm font-medium")
                 ui.label(
                     "增量同步成功后只保留每个标的的最新行情；失败时保留当前可用数据。"
@@ -1305,12 +1453,6 @@ def render_data_page(model: DataPageModel | None) -> None:
                 "同步范围来自唯一的“关注标的”池。所选数据源优先，失败时按固定顺序"
                 "尝试其余可用来源。"
             ).classes("text-sm text-slate-600")
-            source_choices = {source.provider: source.source_name for source in state.sources}
-            if selected_source_provider not in source_choices:
-                selected_source_provider = (
-                    "tencent" if "tencent" in source_choices else state.sources[0].provider
-                )
-
             def select_source(event: object) -> None:
                 nonlocal selected_source_provider
                 value = getattr(event, "value", None)
@@ -1324,9 +1466,8 @@ def render_data_page(model: DataPageModel | None) -> None:
                 value=selected_source_provider,
                 on_change=select_source,
             ).props("aria-label=行情数据源").classes("w-full max-w-sm")
-            source = next(
-                item for item in state.sources if item.provider == selected_source_provider
-            )
+            assert selected_source is not None
+            source = selected_source
             with ui.card().classes("w-full border border-slate-200 shadow-none"):
                 with ui.row().classes("w-full justify-between items-start"):
                     with ui.column().classes("gap-1"):
@@ -1384,65 +1525,6 @@ def render_data_page(model: DataPageModel | None) -> None:
                         ui.label("质量问题：" + "、".join(source.quality.issue_codes)).classes(
                             "text-xs text-amber-800"
                         )
-
-                def sync(
-                    targets: tuple[InstrumentId, ...] | None = None,
-                    *,
-                    only_missing: bool = False,
-                ) -> None:
-                    validation = DataSyncRangeForm(
-                        selected_range_mode,
-                        selected_start_text,
-                        selected_end_text,
-                    ).validate()
-                    range_errors.clear()
-                    if validation.errors:
-                        with range_errors:
-                            for message in validation.errors.values():
-                                ui.label(message).classes("text-sm text-red-700")
-                        return
-                    assert validation.date_range is not None
-                    if only_missing:
-                        try:
-                            targets = model.state().missing_instruments
-                        except Exception:
-                            ui.notify("无法读取最新标的池，请刷新页面后重试。", type="negative")
-                            return
-                        if not targets:
-                            ui.notify("当前没有缺失行情的标的。", type="info")
-                            content.refresh()
-                            return
-                    try:
-                        model.start_sync(
-                            source.provider,
-                            validation.date_range,
-                            targets,
-                        )
-                    except Exception as error:
-                        error_code = getattr(error, "code", None)
-                        if error_code == "SYNC_TARGET_INVALID" or (
-                            isinstance(error, ValueError)
-                            and str(error) == "SYNC_TARGET_INVALID"
-                        ):
-                            ui.notify(
-                                "标的池已经变化，已刷新页面，请重新选择后同步。",
-                                type="warning",
-                            )
-                            content.refresh()
-                        elif error_code == "DATA_SYNC_SUBMISSION_FAILED" or (
-                            isinstance(error, ValueError)
-                            and str(error) == "DATA_SYNC_ALREADY_ACTIVE"
-                        ):
-                            ui.notify("已有行情任务进行中，请稍后重试。", type="warning")
-                            content.refresh()
-                        else:
-                            ui.notify(
-                                "同步未启动，请检查任务状态或本地日志。",
-                                type="negative",
-                            )
-                    else:
-                        poll_timer.activate()
-                        content.refresh()
 
                 with ui.row().classes("w-full gap-2 items-center flex-wrap"):
                     all_button = ui.button(

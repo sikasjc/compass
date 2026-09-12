@@ -9,9 +9,9 @@ import sys
 _DATA_DIR_ENVIRONMENT = "COMPASS_DATA_DIR"
 
 
-def _default_runtime_root(platform: str | None = None) -> Path:
+def _default_runtime_root(platform: str | None = None, *, use_override: bool = True) -> Path:
     configured = os.getenv(_DATA_DIR_ENVIRONMENT, "").strip()
-    if configured:
+    if configured and use_override:
         return Path(configured).expanduser().resolve()
     active_platform = sys.platform if platform is None else platform
     if active_platform == "win32":
@@ -51,3 +51,13 @@ class Settings:
     def ensure_directories(self) -> None:
         for path in (self.market_data_dir, self.reports_dir, self.logs_dir):
             path.mkdir(parents=True, exist_ok=True)
+
+
+def runtime_label(root: Path) -> str:
+    if root.resolve() == _default_runtime_root(use_override=False):
+        return "正式数据"
+    if os.getenv("COMPASS_ENV") == "test" or any(
+        part == ".tmp" or part.startswith("pytest-") for part in root.parts
+    ):
+        return "测试数据"
+    return "自定义数据"

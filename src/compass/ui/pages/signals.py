@@ -7,6 +7,7 @@ import re
 from typing import Protocol
 
 from nicegui import ui
+from compass.ui.edit_guard import EditGuard
 from nicegui.elements.dialog import Dialog
 from compass.ui.navigation import account_url
 from compass.services.task_manager import TaskManager, TaskSnapshot, TaskStatus, TaskOperationError
@@ -260,6 +261,8 @@ def _percent(value: object, *, label: str) -> Decimal:
 
 def _error_text(error: Exception) -> str:
     raw = str(error)
+    if "持仓已在其他页面更新" in raw:
+        return "持仓已在其他页面更新，请刷新并重新生成建议后再登记成交"
     code = raw.split(":", 1)[0]
     if re.fullmatch(r"[A-Z][A-Z0-9_]*", code):
         translations = {
@@ -432,6 +435,7 @@ def render_signals_page(model: SignalPageModel | None) -> None:
         ui.label("今日信号服务尚未配置").classes("text-negative")
         return
     state = model.state()
+    guard = EditGuard(scope=".compass-signal-form")
     choice_by_code = {str(item.instrument): item for item in state.instruments}
     option_labels = {code: _instrument_label(item) for code, item in choice_by_code.items()}
     configured_strategies = {
@@ -464,8 +468,11 @@ def render_signals_page(model: SignalPageModel | None) -> None:
             "text-sm text-grey-7"
         )
 
-        def switch_account(account_id: object) -> None:
-            ui.navigate.to(account_url("/signals", str(account_id)))
+        async def switch_account(account_id: object) -> None:
+            if account_id == state.active_account_profile.account_id:
+                return
+            if not await guard.navigate(account_url("/signals", str(account_id))):
+                account_select.set_value(state.active_account_profile.account_id)
 
         account_options = {item.account_id: item.name for item in state.account_profiles}
         with ui.row().classes("w-full items-end gap-2"):
@@ -482,22 +489,21 @@ def render_signals_page(model: SignalPageModel | None) -> None:
             ui.button(
                 "前往账户页维护",
                 icon="manage_accounts",
-                on_click=lambda: ui.navigate.to(
+                on_click=lambda: guard.navigate(
                     account_url("/account", state.active_account_profile.account_id)
                 ),
             ).props("outline")
 
-    result_slot = ui.column().classes("w-full")
-    with ui.expansion("查看当前持仓", icon="account_balance_wallet").classes("w-full"):
-        ui.label(f"1. 当前持仓 · {state.active_account_profile.name}").classes(
-            "text-subtitle1 font-semibold"
-        )
+    with ui.expansion(
+        f"当前持仓 · {state.active_account_profile.name}",
+        icon="account_balance_wallet",
+    ).classes("w-full border border-slate-200 rounded"):
         if state.account is None:
             ui.label("尚未保存持仓，请到账户页面完成账户和持仓配置。")
             ui.button(
                 "配置账户持仓",
                 icon="manage_accounts",
-                on_click=lambda: ui.navigate.to(
+                on_click=lambda: guard.navigate(
                     account_url("/account", state.active_account_profile.account_id)
                 ),
             ).props("outline")
@@ -538,8 +544,7 @@ def render_signals_page(model: SignalPageModel | None) -> None:
 
     with ui.expansion(
         "策略配置与生成建议", icon="tune", value=state.latest_decision is None
-    ).classes("w-full border border-slate-200 rounded"):
-        ui.label("2. 选择策略并生成最新收盘信号").classes("text-subtitle1 font-semibold")
+    ).classes("w-full border border-slate-200 rounded compass-signal-form"):
         if not state.strategies:
             ui.label("暂无启用的已保存策略，请先到策略实验室创建策略模板。")
             ui.link("前往创建策略", "/strategies")
@@ -570,7 +575,7 @@ def render_signals_page(model: SignalPageModel | None) -> None:
                     if row["selected"] is True
                 )
 
-            def save_strategy_configuration() -> None:
+            async def save_strategy_configuration() -> None:
                 try:
                     model.save_strategy_configuration(
                         selected_allocations(),
@@ -580,6 +585,7 @@ def render_signals_page(model: SignalPageModel | None) -> None:
                 except Exception as error:
                     ui.notify(_error_text(error), type="negative")
                     return
+                await guard.clear()
                 ui.notify("当前方案的策略设置已保存", type="positive")
 
             def generate_signal() -> None:
@@ -607,11 +613,16 @@ def render_signals_page(model: SignalPageModel | None) -> None:
             ).set_enabled(state.account is not None and bool(state.strategies))
         generation_status = ui.label("").classes("text-sm text-slate-600")
 
+    # Create the result container after the setup panels so NiceGUI keeps the
+    # workflow in visual order even though its contents refresh in place.
+    result_slot = ui.column().classes("w-full")
+
     @ui.refreshable
     def decision_view() -> None:
         record = selected_decision["record"]
-        with ui.card().classes("w-full"):
-            ui.label("3. 调仓建议").classes("text-subtitle1 font-semibold")
+        with ui.expansion("调仓建议", icon="swap_horiz").classes(
+            "w-full border border-slate-200 rounded"
+        ):
             if record is None:
                 ui.label("尚未生成信号。保存持仓并选择策略后即可生成。")
                 return

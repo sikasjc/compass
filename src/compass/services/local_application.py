@@ -522,7 +522,7 @@ def build_local_application(
         accounts = AccountRepository(database, "main", clock)
         signal_accounts = SignalAccountRepository(settings.root / "data" / "signal_accounts.json")
         signal_executions = SignalExecutionRepository(
-            settings.root / "data" / "signal_executions.json"
+            settings.root / "data" / "signal_executions.json", database
         )
         decision_repository = DecisionExportRepository(
             database,
@@ -596,7 +596,15 @@ def build_local_application(
         from compass.ui.app import AppViewModels
         from compass.ui.pages.account_overview import AccountOverviewPageModel
 
-        data_model = DataPageModel(data_gateway, tasks)
+        data_model = DataPageModel(
+            data_gateway,
+            tasks,
+            latest_completed_session=(
+                (lambda: exchange_calendar.latest_completed_session(clock()))
+                if expected_sessions is None
+                else None
+            ),
+        )
         scheduler = LocalScheduler(clock=clock)
         automatic_market_sync = AutomaticMarketSync(
             settings=settings_gateway,

@@ -48,6 +48,7 @@ def _create_actual_local_artifact_v1_database(
     with sqlite3.connect(database_path) as connection:
         connection.executescript(
             """
+            DROP TABLE signal_execution_registry;
             DROP TABLE decision_exports;
             DROP TABLE backtest_reports;
             DROP TABLE dataset_bundles;

@@ -5,7 +5,7 @@ from collections.abc import Callable
 from datetime import date
 
 from nicegui import ui
-from compass.ui.pages.watchlists import WatchlistPageModel
+from compass.ui.pages.watchlists import WatchlistPageModel, WatchlistPageState
 from compass.ui.pages.signals import SignalPageModel
 from compass.services.task_manager import TaskManager, TaskStatus
 from compass.ui.task_status import task_status_label
@@ -80,6 +80,41 @@ _DATA_ENTRIES = (
 )
 
 
+def _market_readiness(
+    watchlist: WatchlistPageState,
+    expected: date | None,
+) -> tuple[date | None, bool]:
+    """Return the oldest current endpoint and whether the whole pool is current."""
+
+    pool = watchlist.entry
+    needed = set(pool.instruments) if pool else set()
+    days_by_instrument = {
+        item.instrument: item.last_day for item in watchlist.data_ranges
+    }
+    available_days = tuple(
+        days_by_instrument[instrument]
+        for instrument in needed
+        if instrument in days_by_instrument
+    )
+    data_day = min(available_days, default=None)
+    ready = bool(needed) and len(available_days) == len(needed) and (
+        expected is not None and data_day is not None and data_day >= expected
+    )
+    return data_day, ready
+
+
+def _action_link(label: str, route: str, *, primary: bool = False) -> None:
+    classes = (
+        "no-underline inline-flex items-center rounded px-4 py-2 "
+        + (
+            "bg-emerald-700 text-white hover:bg-emerald-800"
+            if primary
+            else "text-emerald-700 hover:bg-emerald-50"
+        )
+    )
+    ui.link(label, target=route).classes(classes)
+
+
 def _entry_card(entry: StartPageEntry) -> None:
     with ui.link(target=entry.route).classes("no-underline text-inherit w-full"):
         with ui.card().classes(
@@ -150,26 +185,25 @@ def render_workbench(
     @ui.refreshable
     def status() -> None:
         try:
-            pool = watchlists.state().entry
+            watchlist_state = watchlists.state()
+            pool = watchlist_state.entry
             state = signals.state()
         except Exception:
             ui.label("工作台状态暂不可用，请到日志查看原因。").classes("text-red-700")
             ui.button("查看日志", on_click=lambda: ui.navigate.to("/logs"))
             return
-        data_day = min((item.data_day for item in state.instruments), default=None)
         try:
             expected = latest_session() if latest_session else None
         except Exception:
             expected = None
-        needed = set(pool.instruments) if pool else set()
-        available = {item.instrument for item in state.instruments}
-        data_ready = bool(needed) and needed <= available and (
-            expected is not None and data_day is not None and data_day >= expected
-        )
+        data_day, data_ready = _market_readiness(watchlist_state, expected)
+        data_step_label = "同步完整行情"
+        if not data_ready and data_day is not None and expected is not None:
+            data_step_label += f"（当前 {data_day}，目标 {expected}）"
         account_id = state.active_account_profile.account_id
         steps = (
             ("添加关注标的", bool(pool and pool.enabled), "/watchlists"),
-            ("同步完整行情", data_ready, "/data"),
+            (data_step_label, data_ready, "/data"),
             ("创建并启用策略", bool(state.strategies), "/strategies"),
             ("保存账户持仓", state.account is not None, account_url("/account", account_id)),
         )
@@ -182,7 +216,8 @@ def render_workbench(
                 "准备已完成，可以生成今日建议。" if all(item[1] for item in steps)
                 else f"下一步：{next_step[0]}"
             ).classes("text-sm text-slate-600")
-            ui.button(next_step[0], icon="arrow_forward", on_click=lambda: ui.navigate.to(next_step[2]))
+            next_action = "前往同步行情" if next_step[2] == "/data" else next_step[0]
+            _action_link(next_action, next_step[2], primary=True)
         with ui.grid(columns=3).classes("w-full gap-4 max-md:grid-cols-1"):
             pending = sum(
                 signals.execution(item.decision_id) is None
@@ -210,7 +245,14 @@ def render_workbench(
                         ui.icon("check_circle" if ready else "radio_button_unchecked",
                                 color="positive" if ready else "grey")
                         ui.label(label)
-                    ui.button("查看" if ready else "去完成", on_click=lambda target=route: ui.navigate.to(target)).props("flat")
+                    action_label = (
+                        "查看"
+                        if ready
+                        else "前往同步"
+                        if route == "/data"
+                        else "去完成"
+                    )
+                    _action_link(action_label, route)
         if tasks is not None:
             with ui.card().classes("w-full shadow-none border border-slate-200"):
                 ui.label("最近任务").classes("font-semibold")

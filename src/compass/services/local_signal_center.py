@@ -3,7 +3,7 @@ from __future__ import annotations
 from bisect import bisect_right
 from collections.abc import Callable, Mapping, Sequence
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal, DecimalException
 from numbers import Number
@@ -1126,6 +1126,8 @@ class LocalSignalCenter:
         current = self._active_accounts().latest()
         if current is None:
             raise LookupError("ACCOUNT_SNAPSHOT_MISSING")
+        if current.content_hash != decision.result.account_snapshot_hash:
+            raise ValueError("SIGNAL_DECISION_STALE")
         positions = {str(item.instrument): item for item in current.snapshot.positions}
         cash = current.snapshot.cash
         for fill in fills:
@@ -1192,7 +1194,8 @@ class LocalSignalCenter:
         if status is SignalExecutionStatus.PARTIAL and is_complete:
             raise ValueError("SIGNAL_EXECUTION_ALREADY_COMPLETE")
         snapshot = AccountSnapshot(current.snapshot.as_of, cash, tuple(positions.values()))
-        saved = self._active_accounts().save(snapshot)
+        # Validate the complete record before any account write. The real snapshot
+        # identity is assigned below, inside the shared SQLite transaction.
         record = SignalExecutionRecord(
             decision_id,
             self.active_account_profile().account_id,
@@ -1200,19 +1203,16 @@ class LocalSignalCenter:
             tuple(sorted(parsed_fills, key=lambda item: item.instrument)),
             parsed_fees,
             recorded_at,
-            saved.row_id,
+            current.row_id,
         )
-        try:
-            return self._executions.save(record)
-        except Exception:
-            current = self._active_accounts().latest()
-            if current is not None and current.row_id == saved.row_id:
-                self._active_accounts().compact_duplicates(
-                    frozenset(
-                        self._decisions.referenced_account_snapshot_ids()
-                    )
-                )
-            raise
+        accounts = self._active_accounts()
+        with accounts.transaction() as transaction:
+            saved = accounts.save(
+                snapshot, expected_row_id=current.row_id, transaction=transaction,
+            )
+            record = replace(record, resulting_snapshot_row_id=saved.row_id)
+            self._executions.save(record, session=transaction)
+        return record
 
     @staticmethod
     def _decision_belongs_to(

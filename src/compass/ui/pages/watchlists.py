@@ -7,6 +7,7 @@ import re
 from typing import Protocol, TypeVar
 
 from nicegui import ui
+from compass.ui.edit_guard import EditGuard
 
 from compass.data.base import default_instrument_type
 from compass.domain.market import AssetType, Exchange, InstrumentId
@@ -260,9 +261,10 @@ def render_watchlists_page(model: WatchlistPageModel | None) -> None:
     except Exception:
         ui.label("标的池读取失败，请查看本地日志。").classes("text-red-700")
         return
+    guard = EditGuard(scope=".compass-watchlist-form")
     selected_codes = [] if state.entry is None else list(map(str, state.entry.instruments))
     data_ranges = {item.instrument: item for item in state.data_ranges}
-    with ui.card().classes("w-full border border-slate-200 shadow-none"):
+    with ui.card().classes("w-full border border-slate-200 shadow-none compass-watchlist-form"):
         ui.label("关注标的").classes("text-lg font-semibold")
         ui.label("项目只维护这一个标的池。保存后，行情数据页会按这里的标的增量获取数据。").classes(
             "text-sm text-slate-600"
@@ -306,6 +308,7 @@ def render_watchlists_page(model: WatchlistPageModel | None) -> None:
                         )
 
                         def remove(code: str = canonical_code) -> None:
+                            guard.mark()
                             selected_codes.remove(code)
                             instrument_groups.refresh()
 
@@ -345,6 +348,7 @@ def render_watchlists_page(model: WatchlistPageModel | None) -> None:
             for label, additions in QUICK_SELECTIONS:
 
                 def append_selected(codes: tuple[str, ...] = additions) -> None:
+                    guard.mark()
                     selected_codes[:] = _append_symbols(
                         "\n".join(selected_codes), codes
                     ).splitlines()
@@ -383,6 +387,7 @@ def render_watchlists_page(model: WatchlistPageModel | None) -> None:
                 except ValueError as error:
                     ui.notify(str(error), type="warning")
                     return
+                guard.mark()
                 selected_codes[:] = _append_symbols(
                     "\n".join(selected_codes), additions
                 ).splitlines()
@@ -395,7 +400,7 @@ def render_watchlists_page(model: WatchlistPageModel | None) -> None:
         )
         feedback = ui.column().classes("w-full gap-1")
 
-        def save() -> None:
+        async def save() -> None:
             result = model.save(WatchlistFormModel("关注标的", "\n".join(selected_codes)))
             feedback.clear()
             with feedback:
@@ -403,6 +408,7 @@ def render_watchlists_page(model: WatchlistPageModel | None) -> None:
                     for message in result.errors.values():
                         ui.label(message).classes("text-sm text-red-700")
                 else:
+                    await guard.clear()
                     ui.label("关注标的已保存。行情数据页将使用这个标的池。").classes(
                         "text-sm text-emerald-700"
                     )

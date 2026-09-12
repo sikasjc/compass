@@ -454,7 +454,7 @@ def _precanonical_current_signature() -> _SchemaSignature:
     connection = sqlite3.connect(":memory:")
     try:
         current_table_names = {name for name, _ in canonical.table_sql}
-        preserved = current_table_names - _PRECANONICAL_CURRENT_REBUILT_TABLES
+        preserved = current_table_names - _PRECANONICAL_CURRENT_REBUILT_TABLES - {"signal_execution_registry"}
         _create_canonical_tables(connection, canonical, preserved)
         for statement in _PRECANONICAL_CURRENT_DDL:
             connection.execute(statement)
@@ -479,6 +479,17 @@ def _precanonical_current_signature() -> _SchemaSignature:
         connection.close()
 
 
+@lru_cache(maxsize=1)
+def _before_execution_registry_signature() -> _SchemaSignature:
+    layout = _canonical_schema_layout()
+    with closing(sqlite3.connect(":memory:")) as connection:
+        _create_canonical_tables(
+            connection, layout,
+            {name for name, _ in layout.table_sql} - {"signal_execution_registry"},
+        )
+        return _schema_layout_from_connection(connection).signature
+
+
 def _is_empty_schema(signature: _SchemaSignature) -> bool:
     return not (
         signature.objects
@@ -498,6 +509,8 @@ def _schema_variant(
         return "empty"
     if signature == canonical.signature:
         return "current"
+    if signature == _before_execution_registry_signature():
+        return "before-execution-registry"
     if signature == _a1_signature():
         return "a1"
     if signature == _local_artifact_v1_signature():
@@ -928,6 +941,8 @@ def _migrate_sqlite_schema(path: Path, *, allow_empty: bool) -> None:
                 _migrate_local_artifact_v1(connection, layout)
             elif variant == "precanonical-current":
                 _rebuild_precanonical_current(connection, layout)
+            if "signal_execution_registry" not in _user_table_names(connection):
+                _create_canonical_tables(connection, layout, {"signal_execution_registry"})
             _quarantine_current_legacy_decision_exports(connection)
             validate_local_insertion_sequence(connection)
             if _schema_layout_from_connection(connection).signature != layout.signature:

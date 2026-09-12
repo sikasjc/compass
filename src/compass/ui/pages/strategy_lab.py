@@ -884,16 +884,25 @@ def render_strategy_lab_page(
         ui.button("添加 ETF 标的", icon="add", on_click=lambda: ui.navigate.to("/watchlists"))
         ui.button("同步行情", icon="sync", on_click=lambda: ui.navigate.to("/data"))
         return
-    guard = EditGuard()
+    guard = EditGuard(scope=".compass-backtest-form")
     restored: StrategyLabConfiguration | None = None
     restored_name = "我的研究配置"
+    loaded_configuration_key: str | None = None
+    configuration_load_error: str | None = None
     try:
         if source_run:
             restored = model.report_configuration(source_run)
         elif configuration_key and model.workspace:
-            saved_configuration = model.workspace.get(configuration_key)
-            restored = saved_configuration.configuration
-            restored_name = saved_configuration.name
+            try:
+                saved_configuration = model.workspace.get(configuration_key)
+            except (LookupError, OSError, ValueError) as error:
+                # A stale URL or a damaged saved-configuration file must not
+                # make the independent backtest and report views unavailable.
+                configuration_load_error = str(error)
+            else:
+                restored = saved_configuration.configuration
+                restored_name = saved_configuration.name
+                loaded_configuration_key = configuration_key
         if restored is not None:
             needed = {restored.benchmark} | {
                 item for leg in restored.strategies for item in leg.instruments
@@ -946,18 +955,48 @@ def render_strategy_lab_page(
         result_tab = ui.tab("运行与结果")
         history_tab = ui.tab("历史与对比")
     with ui.tab_panels(sections, value=configure_tab).classes("w-full"):
-        configure_panel = ui.tab_panel(configure_tab).classes("p-0")
+        configure_panel = ui.tab_panel(configure_tab).classes("p-0 compass-backtest-form")
         result_panel = ui.tab_panel(result_tab).classes("p-0")
         history_container = ui.tab_panel(history_tab).classes("p-0")
 
     with configure_panel:
         with ui.card().classes("w-full border shadow-none"):
             ui.label("保存与恢复研究配置").classes("font-semibold")
-            saved_options = {item.key: item.name for item in model.saved_configurations()}
+            if configuration_load_error:
+                ui.label(f"所选配置未载入：{configuration_load_error}").classes("text-amber-800")
+            configuration_store_available = True
+            try:
+                saved_options = {item.key: item.name for item in model.saved_configurations()}
+            except (ValueError, OSError) as error:
+                configuration_store_available = False
+                saved_options = {}
+                ui.label(f"已保存配置暂不可用：{error}").classes("text-amber-800")
+                ui.link("从备份恢复", "/settings")
+
+                async def reset_configuration_store() -> None:
+                    with ui.dialog().props("persistent") as dialog, ui.card():
+                        ui.label("保留损坏文件副本并重建配置列表？历史回测报告会保留。")
+                        ui.button("取消", on_click=lambda: dialog.submit(False)).props("flat")
+                        ui.button("保留副本并重建", on_click=lambda: dialog.submit(True))
+                    confirmed = await dialog
+                    dialog.delete()
+                    if not confirmed or not await guard.confirm_leave():
+                        return
+                    try:
+                        assert model.workspace is not None
+                        model.workspace.reset_corrupt()
+                    except (ValueError, OSError) as error:
+                        ui.notify(str(error), type="negative")
+                        return
+                    await guard.clear()
+                    ui.navigate.to("/backtests")
+
+                ui.button("保留损坏文件并重建列表", on_click=reset_configuration_store)
+            editing_key = {"value": loaded_configuration_key}
             saved_select = ui.select(
                 saved_options, label="已保存配置",
                 value=configuration_key if configuration_key in saved_options else None,
-            ).classes("w-full")
+            ).classes("w-full compass-edit-ignore")
             ui.button("载入配置", icon="folder_open", on_click=lambda: guard.navigate(
                 "/backtests?" + urlencode({"configuration_key": str(saved_select.value)})
             )).props("outline").bind_enabled_from(saved_select, "value", backward=bool)
@@ -1677,8 +1716,11 @@ def render_strategy_lab_page(
             def start_backtest() -> None:
                 try:
                     selected_configuration = configuration()
-                    if model.workspace:
-                        model.save_configuration("上次运行配置", selected_configuration, key="last-run")
+                    if model.workspace and configuration_store_available:
+                        try:
+                            model.save_configuration("上次运行配置", selected_configuration, key="last-run")
+                        except (ValueError, OSError) as error:
+                            ui.notify(f"配置快照未保存，回测仍会启动：{error}", type="warning")
                     model.start(selected_configuration)
                 except Exception as error:
                     ui.notify(
@@ -1693,14 +1735,19 @@ def render_strategy_lab_page(
                 poll_timer.activate()
                 sections.set_value(result_tab)
 
-            def save_configuration() -> None:
+            def save_configuration(*, save_as: bool = False) -> None:
                 try:
-                    saved = model.save_configuration(str(config_name.value), configuration())
+                    saved = model.save_configuration(
+                        str(config_name.value), configuration(),
+                        key=None if save_as else editing_key["value"],
+                    )
                 except Exception as error:
                     ui.notify(f"配置未保存：{error}", type="negative")
                     return
                 saved_select.set_options({item.key: item.name for item in model.saved_configurations()})
                 saved_select.set_value(saved.key)
+                editing_key["value"] = saved.key
+                save_config_button.set_text("更新当前配置")
                 guard.clear()
                 ui.notify("研究配置已保存，可在下次启动时载入。", type="positive")
 
@@ -1708,7 +1755,42 @@ def render_strategy_lab_page(
                 run_button = ui.button("运行回测", on_click=start_backtest, icon="play_arrow").props(
                     "color=primary"
                 )
-                ui.button("保存配置", icon="save", on_click=save_configuration).props("outline")
+                save_config_button = ui.button(
+                    "更新当前配置" if editing_key["value"] else "保存新配置",
+                    icon="save", on_click=save_configuration,
+                ).props("outline").set_enabled(configuration_store_available)
+                ui.button("另存为", on_click=lambda: save_configuration(save_as=True)).props(
+                    "outline"
+                ).set_enabled(configuration_store_available)
+
+                async def delete_configuration() -> None:
+                    key = saved_select.value
+                    if not key or model.workspace is None:
+                        return
+                    with ui.dialog().props("persistent") as dialog, ui.card():
+                        ui.label(f"删除配置“{saved_select.options[key]}”？历史报告会保留。")
+                        ui.button("取消", on_click=lambda: dialog.submit(False)).props("flat")
+                        ui.button("删除", on_click=lambda: dialog.submit(True)).props("color=negative")
+                    confirmed = await dialog
+                    dialog.delete()
+                    if not confirmed:
+                        return
+                    try:
+                        model.workspace.delete(str(key))
+                    except (ValueError, OSError, LookupError) as error:
+                        ui.notify(str(error), type="negative")
+                        return
+                    if editing_key["value"] == key:
+                        editing_key["value"] = None
+                        save_config_button.set_text("保存新配置")
+                        guard.mark()
+                    saved_select.set_options({item.key: item.name for item in model.saved_configurations()})
+                    saved_select.set_value(None)
+                    ui.notify("配置已删除，当前表单内容保留。", type="positive")
+
+                ui.button("删除所选配置", on_click=delete_configuration).props("flat").bind_enabled_from(
+                    saved_select, "value", backward=bool,
+                )
                 ui.button(
                     "前往策略实验室",
                     on_click=lambda: guard.navigate("/strategies"),

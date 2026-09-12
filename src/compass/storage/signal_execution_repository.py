@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Sequence, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, DecimalException
@@ -11,6 +12,11 @@ from pathlib import Path
 from threading import RLock
 from uuid import uuid4
 
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from compass.storage.database import Database
+from compass.storage.models import SignalExecutionRegistry
 from compass.services.safe_display import safe_identifier
 from compass.storage.canonical_json import canonical_json, content_hash, decode_canonical_json
 
@@ -104,13 +110,34 @@ class SignalExecutionRecord:
 
 
 class SignalExecutionRepository:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, database: Database | None = None) -> None:
         if not isinstance(path, Path):
             raise TypeError("execution registry path must be a Path")
         self._path = path
         self._lock = RLock()
-        if not path.exists():
+        self._database = database
+        if database is not None:
+            with self._transaction() as session:
+                assert session is not None
+                if session.get(SignalExecutionRegistry, 1) is None:
+                    records = self._decode(path.read_text("utf-8")) if path.exists() else ()
+                    self._write(records, session=session)
+        elif not path.exists():
             self._write(())
+
+    @contextmanager
+    def _transaction(self, session: Session | None = None) -> Iterator[Session | None]:
+        if session is not None:
+            if self._database is None or session.get_bind() is not self._database.engine:
+                raise ValueError("execution and account must share the same database")
+            yield session
+        elif self._database is None:
+            yield None
+        else:
+            with self._database.session_factory() as owned:
+                owned.execute(text("BEGIN IMMEDIATE"))
+                yield owned
+                owned.commit()
 
     def get(self, decision_id: str) -> SignalExecutionRecord | None:
         checked = safe_identifier(decision_id, label="execution decision id")
@@ -120,14 +147,19 @@ class SignalExecutionRepository:
         with self._lock:
             return self._read()
 
-    def save(self, record: SignalExecutionRecord) -> SignalExecutionRecord:
+    def save(
+        self, record: SignalExecutionRecord, *, session: Session | None = None
+    ) -> SignalExecutionRecord:
         if type(record) is not SignalExecutionRecord:
             raise TypeError("execution record must be exact")
-        with self._lock:
-            records = self._read()
+        with self._lock, self._transaction(session) as transaction:
+            records = self._read(transaction)
             if any(item.decision_id == record.decision_id for item in records):
                 raise ValueError("SIGNAL_EXECUTION_ALREADY_RECORDED")
-            self._write(tuple(sorted((*records, record), key=lambda item: item.decision_id)))
+            self._write(
+                tuple(sorted((*records, record), key=lambda item: item.decision_id)),
+                session=transaction,
+            )
             return record
 
     def delete(self, decision_ids: Sequence[str]) -> int:
@@ -136,17 +168,28 @@ class SignalExecutionRepository:
         )
         if not checked:
             return 0
-        with self._lock:
-            records = self._read()
+        with self._lock, self._transaction() as transaction:
+            records = self._read(transaction)
             kept = tuple(item for item in records if item.decision_id not in checked)
             deleted = len(records) - len(kept)
             if deleted:
-                self._write(kept)
+                self._write(kept, session=transaction)
             return deleted
 
-    def _read(self) -> tuple[SignalExecutionRecord, ...]:
+    def _read(self, session: Session | None = None) -> tuple[SignalExecutionRecord, ...]:
+        if self._database is not None:
+            if session is None:
+                with self._database.session_factory() as owned:
+                    return self._read(owned)
+            row = session.get(SignalExecutionRegistry, 1)
+            if row is None:
+                raise ValueError("SIGNAL_EXECUTION_REGISTRY_INTEGRITY")
+            return self._decode(row.document)
+        return self._decode(self._path.read_text("utf-8"))
+
+    @staticmethod
+    def _decode(text: str) -> tuple[SignalExecutionRecord, ...]:
         try:
-            text = self._path.read_text("utf-8")
             wrapper = json.loads(text)
             if type(wrapper) is not dict or set(wrapper) != {"content_hash", "payload_json"}:
                 raise ValueError
@@ -205,7 +248,9 @@ class SignalExecutionRepository:
         except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
             raise ValueError("SIGNAL_EXECUTION_REGISTRY_INTEGRITY") from None
 
-    def _write(self, records: tuple[SignalExecutionRecord, ...]) -> None:
+    def _write(
+        self, records: tuple[SignalExecutionRecord, ...], *, session: Session | None = None
+    ) -> None:
         payload_json = canonical_json(
             {
                 "records": [
@@ -233,6 +278,16 @@ class SignalExecutionRepository:
         document = canonical_json(
             {"content_hash": content_hash(payload_json), "payload_json": payload_json}
         )
+        if self._database is not None:
+            if session is None:
+                raise ValueError("execution write requires a transaction")
+            row = session.get(SignalExecutionRegistry, 1)
+            if row is None:
+                session.add(SignalExecutionRegistry(id=1, document=document))
+            else:
+                row.document = document
+            session.flush()
+            return
         self._path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self._path.with_name(f".{self._path.name}.{uuid4().hex}.tmp")
         try:

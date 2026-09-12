@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, DecimalException
@@ -12,6 +13,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import delete, select, text
+from sqlalchemy.orm import Session
 
 from compass.domain.market import InstrumentId
 from compass.domain.trading import AccountSnapshot, Position
@@ -197,8 +199,16 @@ class AccountRepository:
     def account_id(self) -> str:
         return self._account_id
 
+    @contextmanager
+    def transaction(self) -> Iterator[Session]:
+        with self._database.session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            yield session
+            session.commit()
+
     def save(
-        self, snapshot: AccountSnapshot, *, expected_row_id: int | None = -1
+        self, snapshot: AccountSnapshot, *, expected_row_id: int | None = -1,
+        transaction: Session | None = None
     ) -> StoredAccountSnapshot:
         if type(snapshot) is not AccountSnapshot:
             raise TypeError("snapshot must be an exact AccountSnapshot")
@@ -221,10 +231,9 @@ class AccountRepository:
             market_value=float_summaries[1],
             equity=float_summaries[2],
         )
-        with self._database.session_factory() as session:
+        with (nullcontext(transaction) if transaction is not None else self.transaction()) as session:
             # Reserve the SQLite writer before reading the version, including
             # writes made by other repository instances or processes.
-            session.execute(text("BEGIN IMMEDIATE"))
             latest = session.scalars(
                 select(AccountSnapshotRow)
                 .where(AccountSnapshotRow.account_id == self._account_id)
@@ -243,7 +252,7 @@ class AccountRepository:
                     )
                 return existing
             session.add(row)
-            session.commit()
+            session.flush()
             session.refresh(row)
             return self._record(row)
 

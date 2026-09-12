@@ -77,31 +77,59 @@ class ResearchWorkspace:
         validated = adapter.validate_json(adapter.dump_json(configuration), strict=True)
         entry = SavedResearchConfiguration(key or uuid4().hex, name.strip(), validated)
         with self._lock:
-            items = [item for item in self.list() if item.key != entry.key] + [entry]
-            payload = canonical_json(
-                {
-                    "schema_version": 1,
-                    "items": [
-                        {
-                            "key": item.key,
-                            "name": item.name,
-                            "configuration": adapter.dump_json(item.configuration).decode("utf-8"),
-                        }
-                        for item in items
-                    ],
-                }
-            )
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_name(f".{self.path.name}.{uuid4().hex}.tmp")
-            try:
-                temporary.write_text(
-                    canonical_json({"payload": payload, "content_hash": content_hash(payload)}),
-                    "utf-8",
-                )
-                os.replace(temporary, self.path)
-            finally:
-                temporary.unlink(missing_ok=True)
+            existing = self.list()
+            if any(item.key != entry.key and item.name == entry.name for item in existing):
+                raise ValueError("已有同名配置，请使用其他名称或更新原配置。")
+            items = [item for item in existing if item.key != entry.key] + [entry]
+            self._write(items)
         return entry
+
+    def delete(self, key: str) -> None:
+        with self._lock:
+            self.get(key)
+            self._write([item for item in self.list() if item.key != key])
+
+    def rename(self, key: str, name: str) -> SavedResearchConfiguration:
+        with self._lock:
+            return self.save(name, self.get(key).configuration, key=key)
+
+    def reset_corrupt(self) -> Path:
+        with self._lock:
+            try:
+                self.list()
+            except ValueError:
+                backup = self.path.with_name(f"{self.path.name}.corrupt-{uuid4().hex}")
+                os.replace(self.path, backup)
+                return backup
+            raise ValueError("配置文件可正常读取，无需重建。")
+
+    def _write(self, items: Sequence[SavedResearchConfiguration]) -> None:
+        from compass.ui.pages.strategy_lab import StrategyLabConfiguration
+
+        adapter = TypeAdapter(StrategyLabConfiguration)
+        payload = canonical_json(
+            {
+                "schema_version": 1,
+                "items": [
+                    {
+                        "key": item.key,
+                        "name": item.name,
+                        "configuration": adapter.dump_json(item.configuration).decode("utf-8"),
+                    }
+                    for item in items
+                ],
+            }
+        )
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".{self.path.name}.{uuid4().hex}.tmp")
+        try:
+            temporary.write_text(
+                canonical_json({"payload": payload, "content_hash": content_hash(payload)}),
+                "utf-8",
+            )
+            os.replace(temporary, self.path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def _sequence(value: object) -> Sequence[object]:

@@ -214,3 +214,10 @@ class LocalInsertionSequence(Base):
     __table_args__ = {"sqlite_autoincrement": True}
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+
+class SignalExecutionRegistry(Base):
+    __tablename__ = "signal_execution_registry"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    document: Mapped[str] = mapped_column(Text)

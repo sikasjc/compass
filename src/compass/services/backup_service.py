@@ -14,7 +14,16 @@ import sqlite3
 
 
 _DIRECTORIES = ("data", "reports", "logs")
+MAX_ARCHIVE_BYTES = 512 * 1024**2
 _MAX_BYTES = 2 * 1024**3
+
+
+def _file_hash(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class BackupService:
@@ -40,46 +49,77 @@ class BackupService:
         database = self.root / "data" / "compass.db"
         if not database.is_file():
             raise ValueError("数据库尚未创建。")
-        # SQLite writes are held while copying the DB and the referenced file set.
-        # Independent JSON writers are detected by rehashing the complete file inventory.
-        with closing(sqlite3.connect(database, timeout=10)) as reservation:
-            reservation.execute("BEGIN IMMEDIATE")
+        files = self._files()
+        if len(files) >= 100_000 or sum(path.stat().st_size for path in files.values()) > _MAX_BYTES:
+            raise ValueError("数据超过完整备份上限（解压后 2 GiB / 100000 个文件）。")
+        required = sum(path.stat().st_size for path in files.values()) + MAX_ARCHIVE_BYTES
+        if shutil.disk_usage(destination.parent).free < required:
+            raise ValueError("磁盘空间不足，无法暂存并生成备份。")
+        try:
             with TemporaryDirectory(dir=destination.parent) as temporary:
-                copied_db = Path(temporary) / "compass.db"
-                with (
-                    closing(sqlite3.connect(database)) as source,
-                    closing(sqlite3.connect(copied_db)) as target,
-                ):
-                    source.backup(target)
-                files = self._files()
-                fingerprints: dict[str, str] = {}
-                with ZipFile(destination, "w", ZIP_DEFLATED) as archive:
-                    for name, path in files.items():
-                        content = (copied_db if name == "data/compass.db" else path).read_bytes()
-                        fingerprints[name] = sha256(content).hexdigest()
-                        archive.writestr(name, content)
-                    current = self._files()
-                    if current.keys() != files.keys() or any(
-                        sha256(path.read_bytes()).hexdigest() != fingerprints[name]
-                        for name, path in current.items()
-                        if name != "data/compass.db"
+                snapshot = Path(temporary)
+                # SQLite's online backup produces a coherent database snapshot.
+                # Release its writer reservation before copying potentially
+                # large market/report/log files, whose writers are independent
+                # of the database lock and are checked by hashes below.
+                with closing(sqlite3.connect(database, timeout=10)) as reservation:
+                    reservation.execute("BEGIN IMMEDIATE")
+                    copied_db = snapshot / "data" / "compass.db"
+                    copied_db.parent.mkdir(parents=True)
+                    with (
+                        closing(sqlite3.connect(database)) as source,
+                        closing(sqlite3.connect(copied_db)) as target,
                     ):
-                        raise ValueError("备份期间数据发生变化，请等待后台任务结束后重试。")
-                    archive.writestr(
-                        "manifest.json",
-                        json.dumps(
-                            {
-                                "schema_version": 1,
-                                "created_at": datetime.now(timezone.utc).isoformat(),
-                                "files": fingerprints,
-                            },
-                            ensure_ascii=False,
-                        ),
-                    )
-            reservation.rollback()
-        return destination
+                        source.backup(target)
+                    reservation.rollback()
+                files = self._files()
+                if sum(path.stat().st_size for path in files.values()) > _MAX_BYTES:
+                    raise ValueError("备份数据已超过 2 GiB，请清理后重试。")
+                fingerprints = {"data/compass.db": _file_hash(copied_db)}
+                for name, path in files.items():
+                    if name == "data/compass.db":
+                        continue
+                    copy = snapshot / name
+                    copy.parent.mkdir(parents=True, exist_ok=True)
+                    with path.open("rb") as source_file, copy.open("wb") as target_file:
+                        shutil.copyfileobj(source_file, target_file, 1024 * 1024)
+                    fingerprints[name] = _file_hash(copy)
+                current = self._files()
+                if current.keys() != files.keys() or any(
+                    _file_hash(path) != fingerprints[name]
+                    for name, path in current.items() if name != "data/compass.db"
+                ):
+                    raise ValueError("备份期间数据发生变化，请等待后台任务结束后重试。")
+                with ZipFile(destination, "w", ZIP_DEFLATED) as archive:
+                    for name in files:
+                        archive.write(snapshot / name, name)
+                    archive.writestr("manifest.json", json.dumps({
+                        "schema_version": 1,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "files": fingerprints,
+                    }, ensure_ascii=False))
+                self.inspect(destination)
+            return destination
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
+
+    def prune_backups(self, keep: int = 5) -> int:
+        if keep < 1:
+            raise ValueError("至少保留一份备份。")
+        folder = (self.root / ".backups").resolve()
+        backups = sorted(folder.glob("compass-*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
+        removed = 0
+        for path in backups[keep:]:
+            if path.is_symlink() or path.resolve().parent != folder:
+                continue
+            path.unlink()
+            removed += 1
+        return removed
 
     def inspect(self, archive_path: Path) -> dict[str, object]:
+        if archive_path.stat().st_size > MAX_ARCHIVE_BYTES:
+            raise ValueError("备份压缩包超过 512 MiB，请清理数据后重新备份。")
         with ZipFile(archive_path) as archive:
             infos = archive.infolist()
             if len(infos) > 100_000 or sum(item.file_size for item in infos) > _MAX_BYTES:
@@ -144,38 +184,61 @@ class BackupService:
         token = uuid4().hex
         staging = self.recovery / f"staged-{token}"
         staging.mkdir()
-        with ZipFile(archive_path) as archive:
-            (staging / "manifest.json").write_bytes(archive.read("manifest.json"))
-            for item in archive.infolist():
-                if item.filename == "manifest.json":
-                    continue
-                target = staging / item.filename
-                if not target.resolve().is_relative_to(staging.resolve()):
-                    raise ValueError("恢复路径超出暂存目录。")
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with archive.open(item) as source, target.open("wb") as output:
-                    shutil.copyfileobj(source, output)
-        with closing(sqlite3.connect(staging / "data" / "compass.db")) as database:
-            if database.execute("PRAGMA integrity_check").fetchone() != ("ok",):
-                raise ValueError("备份数据库完整性检查失败。")
-        pending = self.recovery / f"pending-{token}.tmp"
-        pending.write_text(
-            json.dumps(
-                {
-                    "token": token,
-                    "manifest_hash": sha256((staging / "manifest.json").read_bytes()).hexdigest(),
-                }
-            ),
-            "utf-8",
-        )
         try:
-            os.link(pending, self.recovery / "pending.json")
-        finally:
-            pending.unlink(missing_ok=True)
+            with ZipFile(archive_path) as archive:
+                (staging / "manifest.json").write_bytes(archive.read("manifest.json"))
+                for item in archive.infolist():
+                    if item.filename == "manifest.json":
+                        continue
+                    target = staging / item.filename
+                    if not target.resolve().is_relative_to(staging.resolve()):
+                        raise ValueError("恢复路径超出暂存目录。")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(item) as source, target.open("wb") as output:
+                        shutil.copyfileobj(source, output)
+            with closing(sqlite3.connect(staging / "data" / "compass.db")) as database:
+                if database.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+                    raise ValueError("备份数据库完整性检查失败。")
+            pending = self.recovery / f"pending-{token}.tmp"
+            pending.write_text(
+                json.dumps(
+                    {
+                        "token": token,
+                        "manifest_hash": sha256((staging / "manifest.json").read_bytes()).hexdigest(),
+                    }
+                ),
+                "utf-8",
+            )
+            try:
+                os.link(pending, self.recovery / "pending.json")
+            finally:
+                pending.unlink(missing_ok=True)
+        except BaseException:
+            self._remove_staging(staging)
+            raise
         return summary
 
+    def _remove_staging(self, path: Path) -> None:
+        recovery = self.recovery.resolve()
+        resolved = path.resolve()
+        suffix = path.name.removeprefix("staged-")
+        if (path.is_symlink() or resolved.parent != recovery or not path.name.startswith("staged-")
+                or len(suffix) != 32 or any(c not in "0123456789abcdef" for c in suffix)):
+            raise ValueError("恢复暂存路径无效，未执行清理。")
+        if resolved.exists():
+            shutil.rmtree(resolved)
+
     def cancel_pending(self) -> None:
-        (self.recovery / "pending.json").unlink(missing_ok=True)
+        if (self.recovery / "applying.json").exists():
+            raise ValueError("恢复已经开始，请先重启完成恢复，不能直接取消。")
+        marker = self.recovery / "pending.json"
+        if not marker.exists():
+            return
+        token = json.loads(marker.read_text("utf-8"))["token"]
+        if type(token) is not str or len(token) != 32 or any(c not in "0123456789abcdef" for c in token):
+            raise ValueError("待恢复任务无效，未执行清理。")
+        marker.unlink()
+        self._remove_staging(self.recovery / f"staged-{token}")
 
     def apply_pending(self) -> bool:
         marker = self.recovery / "pending.json"
@@ -233,7 +296,7 @@ class BackupService:
         if set(actual) != set(files) or any(
             path.is_symlink()
             or not path.resolve().is_relative_to(staging.resolve())
-            or sha256(path.read_bytes()).hexdigest() != files[name]
+            or _file_hash(path) != files[name]
             for name, path in actual.items()
         ):
             raise ValueError("暂存备份不完整或发生变化，恢复已停止。")

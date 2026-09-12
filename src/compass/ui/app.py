@@ -4,6 +4,8 @@ import argparse
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import sys
+from functools import partial
+from pathlib import Path
 from datetime import date
 from typing import Protocol, cast
 
@@ -13,7 +15,7 @@ from compass.config import Settings
 from compass.services.local_application import build_local_application
 from compass.services.task_manager import TaskManager
 from compass.ui.layout import NavigationItem, page_shell
-from compass.ui.navigation import account_url
+from compass.ui.navigation import redirect_to_account
 from compass.ui.pages.account_overview import (
     AccountOverviewPageModel,
     render_account_overview_page,
@@ -128,71 +130,86 @@ def register_pages(
     models: AppViewModels,
     *,
     registrar: PageRegistrar | None = None,
+    runtime_root: Path | None = None,
 ) -> None:
+    def account_label(account_id: str) -> str:
+        if models.account_factory:
+            return models.account_factory(account_id).account_name
+        return account_id
+
+    shell = partial(page_shell, runtime_root=runtime_root, account_label=account_label)
     register = registrar or cast(PageRegistrar, ui.page)
 
     def home() -> None:
-        with page_shell("工作台", "查看准备进度、账户和最新任务", NAV_ITEMS):
+        with shell("工作台", "查看准备进度、账户和最新任务", NAV_ITEMS):
+            try:
+                home_signals = models.signals_factory(
+                    ui.context.client.request.query_params.get("account_id")
+                ) if models.signals_factory else models.signals
+            except LookupError:
+                ui.label("账户已删除或不可用，请重新选择账户。")
+                ui.link("重新选择账户", "/account?reset_account=1")
+                return
             render_start_page(
                 models.watchlists,
-                models.signals_factory(None) if models.signals_factory else models.signals,
+                home_signals,
                 models.task_manager,
                 models.latest_session,
             )
 
     def watchlists() -> None:
-        with page_shell("标的池", "选择并维护唯一的关注标的池", NAV_ITEMS):
+        with shell("标的池", "选择并维护唯一的关注标的池", NAV_ITEMS):
             render_watchlists_page(models.watchlists)
 
     def data() -> None:
-        with page_shell("行情数据", "查看来源、质量、缓存与后台同步状态", NAV_ITEMS):
+        with shell("行情数据", "查看来源、质量、缓存与后台同步状态", NAV_ITEMS):
             render_data_page(models.data)
 
     def strategy_lab() -> None:
-        with page_shell("策略实验室", "创建、解释并管理可复用的策略定义", NAV_ITEMS):
+        with shell("策略实验室", "创建、解释并管理可复用的策略定义", NAV_ITEMS):
             render_strategy_library_page(models.strategies)
 
     def rule_editor(draft_id: str | None = None) -> None:
-        with page_shell("规则编辑器", "使用规则与变量创建安全、可复现的策略草稿", NAV_ITEMS):
+        with shell("规则编辑器", "使用规则与变量创建安全、可复现的策略草稿", NAV_ITEMS):
             render_rule_editor_page(models.strategies, draft_id=draft_id)
 
     def rule_preview(draft_id: str | None = None) -> None:
-        with page_shell("信号预览", "检查规则何时命中以及目标仓位如何变化", NAV_ITEMS):
+        with shell("信号预览", "检查规则何时命中以及目标仓位如何变化", NAV_ITEMS):
             render_rule_preview_page(models.strategies, draft_id=draft_id)
 
     def rule_release(draft_id: str | None = None) -> None:
-        with page_shell("验证与发布", "检查执行语义并发布不可变策略版本", NAV_ITEMS):
+        with shell("验证与发布", "检查执行语义并发布不可变策略版本", NAV_ITEMS):
             render_rule_release_page(models.strategies, draft_id=draft_id)
 
     def strategy_templates() -> None:
-        with page_shell("内置模板与参数调优", "创建经典策略或运行参数实验", NAV_ITEMS):
+        with shell("内置模板与参数调优", "创建经典策略或运行参数实验", NAV_ITEMS):
             render_strategy_templates_page(models.strategies)
 
     def backtests(configuration_key: str | None = None, source_run: str | None = None) -> None:
-        with page_shell("策略回测", "配置组合与账户参数，运行回测并查看结果", NAV_ITEMS):
+        with shell("策略回测", "配置组合与账户参数，运行回测并查看结果", NAV_ITEMS):
             render_strategy_lab_page(
                 models.backtests_factory() if models.backtests_factory else models.backtests,
                 configuration_key=configuration_key, source_run=source_run,
             )
 
     def settings() -> None:
-        with page_shell("设置", "管理网络与行情请求参数", NAV_ITEMS):
+        with shell("设置", "管理网络与行情请求参数", NAV_ITEMS):
             render_settings_page(models.settings)
 
     def account(account_id: str | None = None) -> None:
-        with page_shell("账户", "查看持仓、资金变化、建议采用情况与事后影响", NAV_ITEMS):
+        with shell("账户", "查看持仓、资金变化、建议采用情况与事后影响", NAV_ITEMS):
             try:
                 model = models.account_factory(account_id) if models.account_factory else models.account
                 if model is not None and account_id is None:
-                    ui.navigate.to(account_url("/account", model.account_id))
+                    redirect_to_account("/account", model.account_id, runtime_root)
                     return
                 render_account_overview_page(model)
             except LookupError:
                 ui.label("账户已删除或不可用，请重新选择账户。").classes("text-red-700")
-                ui.link("重新选择账户", "/account")
+                ui.link("重新选择账户", "/account?reset_account=1")
 
     def signals(account_id: str | None = None) -> None:
-        with page_shell(
+        with shell(
             "今日信号",
             "连接账户方案、共享持仓、最新收盘信号与执行记录",
             NAV_ITEMS,
@@ -200,15 +217,15 @@ def register_pages(
             try:
                 model = models.signals_factory(account_id) if models.signals_factory else models.signals
                 if model is not None and account_id is None:
-                    ui.navigate.to(account_url("/signals", model.account_id))
+                    redirect_to_account("/signals", model.account_id, runtime_root)
                     return
                 render_signals_page(model)
             except LookupError:
                 ui.label("账户已删除或不可用，请重新选择账户。").classes("text-red-700")
-                ui.link("重新选择账户", "/signals")
+                ui.link("重新选择账户", "/signals?reset_account=1")
 
     def logs() -> None:
-        with page_shell("日志", "查看应用与行情请求的本地脱敏日志", NAV_ITEMS):
+        with shell("日志", "查看应用与行情请求的本地脱敏日志", NAV_ITEMS):
             render_logs_page(models.logs)
 
     handlers: tuple[PageHandler, ...] = (
@@ -246,7 +263,7 @@ def create_app(
         view_models = local_application.models
     else:
         view_models = models
-    register_pages(view_models, registrar=registrar)
+    register_pages(view_models, registrar=registrar, runtime_root=settings.root)
     if local_application is not None:
         app.on_startup(local_application.start)
         app.on_shutdown(local_application.shutdown)
@@ -267,13 +284,16 @@ def run(
     runner: Runner = ui.run,
 ) -> None:
     active_settings = settings or Settings.from_env()
-    app_factory(active_settings)
-    runner(
-        host=configuration.host,
-        port=configuration.port,
-        show=configuration.show,
-        reload=configuration.reload,
-    )
+    from compass.services.runtime_lock import RuntimeLock
+
+    with RuntimeLock(active_settings.root, configuration.port):
+        app_factory(active_settings)
+        runner(
+            host=configuration.host,
+            port=configuration.port,
+            show=configuration.show,
+            reload=configuration.reload,
+        )
 
 
 def main(arguments: Sequence[str] | None = None) -> None:

@@ -1079,9 +1079,10 @@ def test_signal_center_shares_holdings_but_keeps_strategy_decisions_separate(
         application.shutdown()
 
 
-def test_signal_execution_updates_holdings_and_marks_prior_decision_stale(
+@pytest.fixture
+def execution_scenario(
     tmp_path: Path,
-) -> None:
+):
     sequence = count(1)
     application = build_local_application(
         Settings.from_env(tmp_path),
@@ -1124,67 +1125,73 @@ def test_signal_execution_updates_holdings_and_marks_prior_decision_stale(
             item for item in decision.result.recommendations if item.quantity_delta != 0
         )
 
-        execution = application.signal_center.record_execution(
-            decision.decision_id,
-            SignalExecutionStatus.PARTIAL,
-            (
-                SignalExecutionFillInput(
-                    str(recommendation.instrument),
-                    100 if recommendation.quantity_delta > 0 else -100,
-                    recommendation.reference_price,
-                ),
-            ),
-            fees="5.00",
-            recorded_at=NOW + timedelta(minutes=1),
-        )
-
-        latest = application.signal_center.latest_account()
-        assert latest is not None and latest.row_id != original.row_id
-        assert execution.resulting_snapshot_row_id == latest.row_id
-        assert application.signal_center.execution(decision.decision_id) == execution
-        with pytest.raises(
-            ValueError,
-            match="SIGNAL_DECISION_ADOPTED_DELETE_FORBIDDEN",
-        ):
-            application.signal_center.delete_decision(decision.decision_id)
-        assert application.signal_center.clear_decisions() == 0
-        assert application.signal_center.decision(decision.decision_id) == decision
-        assert application.signal_center.decision_freshness(decision).reasons == (
-            "HOLDINGS_CHANGED",
-        )
-        with pytest.raises(ValueError, match="SIGNAL_EXECUTION_ALREADY_RECORDED"):
-            application.signal_center.record_execution(
-                decision.decision_id,
-                SignalExecutionStatus.IGNORED,
-                (),
-                fees="0.00",
-                recorded_at=NOW + timedelta(minutes=2),
-            )
-
-        new_decision = application.signal_center.generate(
-            (SelectedDecisionStrategy(strategy.instance_id, Decimal("0.60")),),
-            cash_reserve=Decimal("0.20"),
-            minimum_trade_amount=Decimal("2000"),
-        )
-        new_recommendation = next(
-            item for item in new_decision.result.recommendations if item.quantity_delta != 0
-        )
-        with pytest.raises(ValueError, match="SIGNAL_EXECUTION_INCOMPLETE"):
-            application.signal_center.record_execution(
-                new_decision.decision_id,
-                SignalExecutionStatus.EXECUTED,
-                (
-                    SignalExecutionFillInput(
-                        str(new_recommendation.instrument),
-                        100 if new_recommendation.quantity_delta > 0 else -100,
-                        new_recommendation.reference_price,
-                    ),
-                ),
-                fees="0.00",
-                recorded_at=NOW + timedelta(minutes=3),
-            )
+        yield application, original, decision, recommendation, strategy
     finally:
         application.shutdown()
+
+
+def test_signal_execution_updates_holdings_and_marks_prior_decision_stale(execution_scenario) -> None:
+    application, original, decision, recommendation, strategy = execution_scenario
+    execution = application.signal_center.record_execution(
+        decision.decision_id,
+        SignalExecutionStatus.PARTIAL,
+        (
+            SignalExecutionFillInput(
+                str(recommendation.instrument),
+                100 if recommendation.quantity_delta > 0 else -100,
+                recommendation.reference_price,
+            ),
+        ),
+        fees="5.00",
+        recorded_at=NOW + timedelta(minutes=1),
+    )
+
+    latest = application.signal_center.latest_account()
+    assert latest is not None and latest.row_id != original.row_id
+    assert execution.resulting_snapshot_row_id == latest.row_id
+    assert application.signal_center.execution(decision.decision_id) == execution
+    with pytest.raises(
+        ValueError,
+        match="SIGNAL_DECISION_ADOPTED_DELETE_FORBIDDEN",
+    ):
+        application.signal_center.delete_decision(decision.decision_id)
+    assert application.signal_center.clear_decisions() == 0
+    assert application.signal_center.decision(decision.decision_id) == decision
+    assert application.signal_center.decision_freshness(decision).reasons == (
+        "HOLDINGS_CHANGED",
+    )
+    with pytest.raises(ValueError, match="SIGNAL_EXECUTION_ALREADY_RECORDED"):
+        application.signal_center.record_execution(
+            decision.decision_id,
+            SignalExecutionStatus.IGNORED,
+            (),
+            fees="0.00",
+            recorded_at=NOW + timedelta(minutes=2),
+        )
+
+    new_decision = application.signal_center.generate(
+        (SelectedDecisionStrategy(strategy.instance_id, Decimal("0.60")),),
+        cash_reserve=Decimal("0.20"),
+        minimum_trade_amount=Decimal("2000"),
+    )
+    new_recommendation = next(
+        item for item in new_decision.result.recommendations if item.quantity_delta != 0
+    )
+    with pytest.raises(ValueError, match="SIGNAL_EXECUTION_INCOMPLETE"):
+        application.signal_center.record_execution(
+            new_decision.decision_id,
+            SignalExecutionStatus.EXECUTED,
+            (
+                SignalExecutionFillInput(
+                    str(new_recommendation.instrument),
+                    100 if new_recommendation.quantity_delta > 0 else -100,
+                    new_recommendation.reference_price,
+                ),
+            ),
+            fees="0.00",
+            recorded_at=NOW + timedelta(minutes=3),
+        )
+
 
 
 def test_saving_after_first_sync_does_not_backdate_cash_account(tmp_path: Path) -> None:
@@ -1227,3 +1234,82 @@ def test_page_accounts_remain_bound_and_reject_stale_saves(tmp_path: Path) -> No
             other.save_account("1", ())
     finally:
         application.shutdown()
+
+
+@pytest.mark.parametrize("failure", ["duplicate", "disk", "interrupt"])
+def test_execution_failure_keeps_account_and_audit_consistent(execution_scenario, monkeypatch, failure):
+    application, original, decision, recommendation, strategy = execution_scenario
+    center = application.signal_center
+    fills = (SignalExecutionFillInput(
+        str(recommendation.instrument),
+        100 if recommendation.quantity_delta > 0 else -100,
+        recommendation.reference_price,
+    ),)
+    with monkeypatch.context() as patch:
+        if failure == "duplicate":
+            bad_fills = fills + fills
+            expected = ValueError
+        else:
+            bad_fills = fills
+            expected = OSError if failure == "disk" else KeyboardInterrupt
+            write = application.signal_executions._write
+            def fail_after_write(*args, **kwargs):
+                write(*args, **kwargs)
+                raise expected("injected write failure")
+            patch.setattr(application.signal_executions, "_write", fail_after_write)
+        with pytest.raises(expected):
+            center.record_execution(decision.decision_id, SignalExecutionStatus.PARTIAL, bad_fills,
+                                    fees="5", recorded_at=NOW + timedelta(minutes=1))
+    assert center.latest_account() == original
+    assert center.execution(decision.decision_id) is None
+    assert not center.decision_freshness(decision).stale
+    saved = center.record_execution(decision.decision_id, SignalExecutionStatus.PARTIAL, fills,
+                                    fees="5", recorded_at=NOW + timedelta(minutes=1))
+    assert saved.resulting_snapshot_row_id == center.latest_account().row_id
+    with pytest.raises(ValueError, match="ALREADY_RECORDED"):
+        center.record_execution(decision.decision_id, SignalExecutionStatus.PARTIAL, fills,
+                                fees="5", recorded_at=NOW + timedelta(minutes=1))
+
+
+def test_execution_rejects_interleaved_manual_save(execution_scenario, monkeypatch):
+    from contextlib import contextmanager
+    application, original, decision, recommendation, strategy = execution_scenario
+    center = application.signal_center
+    accounts = center._active_accounts()
+    transaction = accounts.transaction
+    @contextmanager
+    def interleave():
+        with monkeypatch.context() as patch:
+            patch.setattr(accounts, "transaction", transaction)
+            accounts.save(AccountSnapshot(original.snapshot.as_of, original.snapshot.cash + 10000,
+                                          original.snapshot.positions))
+        with transaction() as session:
+            yield session
+    monkeypatch.setattr(accounts, "transaction", interleave)
+    fills = (SignalExecutionFillInput(str(recommendation.instrument),
+             100 if recommendation.quantity_delta > 0 else -100, recommendation.reference_price),)
+    with pytest.raises(ValueError, match="其他页面更新"):
+        center.record_execution(decision.decision_id, SignalExecutionStatus.PARTIAL, fills,
+                                fees="5", recorded_at=NOW + timedelta(minutes=1))
+    assert center.latest_account().snapshot.cash == original.snapshot.cash + 10000
+    assert center.execution(decision.decision_id) is None
+
+
+def test_execution_rechecks_holdings_after_freshness_read(execution_scenario, monkeypatch):
+    application, original, decision, recommendation, strategy = execution_scenario
+    center = application.signal_center
+    freshness = center.decision_freshness
+    def interleave(record):
+        checked = freshness(record)
+        center._active_accounts().save(AccountSnapshot(
+            original.snapshot.as_of, original.snapshot.cash + 10000, original.snapshot.positions,
+        ))
+        return checked
+    monkeypatch.setattr(center, "decision_freshness", interleave)
+    fills = (SignalExecutionFillInput(str(recommendation.instrument),
+             100 if recommendation.quantity_delta > 0 else -100, recommendation.reference_price),)
+    with pytest.raises(ValueError, match="SIGNAL_DECISION_STALE"):
+        center.record_execution(decision.decision_id, SignalExecutionStatus.PARTIAL, fills,
+                                fees="5", recorded_at=NOW + timedelta(minutes=1))
+    assert center.latest_account().snapshot.cash == original.snapshot.cash + 10000
+    assert center.execution(decision.decision_id) is None
