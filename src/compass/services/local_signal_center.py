@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal, DecimalException
 from numbers import Number
+from threading import RLock
 from types import MappingProxyType
 
 from compass.data.base import default_instrument_type
@@ -295,6 +296,11 @@ class LocalSignalCenter:
         self._account_factory = account_factory
         self._bound_account_id: str | None = None
         self._expected_snapshot_id: int | None = -1
+        # Account-scoped page models are shallow copies of this service. Share
+        # the latest immutable bundle view so route changes do not re-read all
+        # Parquet files.
+        self._instrument_cache: dict[str, tuple[SignalInstrumentChoice, ...]] = {}
+        self._instrument_cache_lock = RLock()
 
     def for_account(self, account_id: str | None = None) -> LocalSignalCenter:
         """Bind a page to an account without changing any other page's selection."""
@@ -365,6 +371,10 @@ class LocalSignalCenter:
         bundle = self._bundles.latest()
         if bundle is None:
             return ()
+        with self._instrument_cache_lock:
+            cached = self._instrument_cache.get(bundle.bundle_id)
+        if cached is not None:
+            return cached
         references = self._bundles.references_by_instrument(bundle)
         choices: list[SignalInstrumentChoice] = []
         for instrument in bundle.instruments:
@@ -390,7 +400,11 @@ class LocalSignalCenter:
                     close,
                 )
             )
-        return tuple(sorted(choices, key=lambda item: str(item.instrument)))
+        result = tuple(sorted(choices, key=lambda item: str(item.instrument)))
+        with self._instrument_cache_lock:
+            self._instrument_cache.clear()
+            self._instrument_cache[bundle.bundle_id] = result
+        return result
 
     def strategies(self) -> tuple[SignalStrategyChoice, ...]:
         return tuple(
@@ -1077,12 +1091,14 @@ class LocalSignalCenter:
             reasons.append("MARKET_DATA_CHANGED")
         else:
             current = self._bundles.references_by_instrument(bundle)
-            for manifest in record.market_manifests:
-                loaded = self._bundles.load_manifest(manifest.manifest_id)
-                reference = current.get(InstrumentId.parse(loaded.instrument))
-                if reference is None or reference.manifest_id != manifest.manifest_id:
-                    reasons.append("MARKET_DATA_CHANGED")
-                    break
+            current_manifest_ids = {
+                reference.manifest_id for reference in current.values()
+            }
+            if any(
+                manifest.manifest_id not in current_manifest_ids
+                for manifest in record.market_manifests
+            ):
+                reasons.append("MARKET_DATA_CHANGED")
         return SignalDecisionFreshness(bool(reasons), tuple(reasons))
 
     def record_execution(

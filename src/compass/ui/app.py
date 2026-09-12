@@ -7,9 +7,9 @@ import sys
 from functools import partial
 from pathlib import Path
 from datetime import date
-from typing import Protocol, cast
+from typing import Protocol, TypeVar, cast
 
-from nicegui import app, ui
+from nicegui import app, run as nicegui_run, ui
 
 from compass.config import Settings
 from compass.services.local_application import build_local_application
@@ -29,7 +29,7 @@ from compass.ui.pages.rule_editor import (
     render_strategy_library_page,
     render_strategy_templates_page,
 )
-from compass.ui.pages.home import render_start_page
+from compass.ui.pages.home import load_workbench_state, render_start_page
 from compass.ui.pages.settings import SettingsPageModel, render_settings_page
 from compass.ui.pages.signals import SignalPageModel, render_signals_page
 from compass.ui.pages.strategy_lab import StrategyLabPageModel, render_strategy_lab_page
@@ -120,10 +120,43 @@ class AppViewModels:
 
 
 PageHandler = Callable[..., None]
+_LoadedState = TypeVar("_LoadedState", bound=object)
 
 
 class PageRegistrar(Protocol):
     def __call__(self, route: str) -> Callable[[PageHandler], PageHandler]: ...
+
+
+def _deferred_render(
+    load: Callable[[], _LoadedState],
+    render: Callable[[_LoadedState], None],
+    *,
+    loading_text: str,
+    error_text: str,
+) -> None:
+    with ui.column().classes("w-full gap-4") as slot:
+        with ui.row().classes("w-full items-center justify-center gap-3 py-10"):
+            ui.spinner(size="lg")
+            ui.label(loading_text).classes("text-sm text-grey-7")
+
+    async def load_content() -> None:
+        try:
+            state = cast(_LoadedState, await nicegui_run.io_bound(load))
+        except Exception:
+            if slot.is_deleted:
+                return
+            slot.clear()
+            with slot:
+                ui.label(error_text).classes("text-red-700")
+                ui.link("查看日志", "/logs")
+            return
+        if slot.is_deleted:
+            return
+        slot.clear()
+        with slot:
+            render(state)
+
+    ui.timer(0.01, load_content, once=True)
 
 
 def register_pages(
@@ -150,12 +183,31 @@ def register_pages(
                 ui.label("账户已删除或不可用，请重新选择账户。")
                 ui.link("重新选择账户", "/account?reset_account=1")
                 return
-            render_start_page(
-                models.watchlists,
-                home_signals,
-                models.task_manager,
-                models.latest_session,
-            )
+            home_watchlists = models.watchlists
+            if home_watchlists is not None and home_signals is not None:
+                _deferred_render(
+                    lambda: load_workbench_state(
+                        home_watchlists,
+                        home_signals,
+                        models.latest_session,
+                    ),
+                    lambda state: render_start_page(
+                        home_watchlists,
+                        home_signals,
+                        models.task_manager,
+                        models.latest_session,
+                        initial_state=state,
+                    ),
+                    loading_text="正在加载工作台状态…",
+                    error_text="工作台状态暂不可用，请到日志查看原因。",
+                )
+            else:
+                render_start_page(
+                    models.watchlists,
+                    home_signals,
+                    models.task_manager,
+                    models.latest_session,
+                )
 
     def watchlists() -> None:
         with shell("标的池", "选择并维护唯一的关注标的池", NAV_ITEMS):
@@ -203,7 +255,18 @@ def register_pages(
                 if model is not None and account_id is None:
                     redirect_to_account("/account", model.account_id, runtime_root)
                     return
-                render_account_overview_page(model)
+                if model is None:
+                    render_account_overview_page(None)
+                else:
+                    _deferred_render(
+                        model.state,
+                        lambda state: render_account_overview_page(
+                            model,
+                            initial_state=state,
+                        ),
+                        loading_text="正在加载账户持仓与分析…",
+                        error_text="账户状态读取失败，请到日志查看原因。",
+                    )
             except LookupError:
                 ui.label("账户已删除或不可用，请重新选择账户。").classes("text-red-700")
                 ui.link("重新选择账户", "/account?reset_account=1")
@@ -219,7 +282,18 @@ def register_pages(
                 if model is not None and account_id is None:
                     redirect_to_account("/signals", model.account_id, runtime_root)
                     return
-                render_signals_page(model)
+                if model is None:
+                    render_signals_page(None)
+                else:
+                    _deferred_render(
+                        model.state,
+                        lambda state: render_signals_page(
+                            model,
+                            initial_state=state,
+                        ),
+                        loading_text="正在加载持仓、策略与历史信号…",
+                        error_text="今日信号读取失败，请到日志查看原因。",
+                    )
             except LookupError:
                 ui.label("账户已删除或不可用，请重新选择账户。").classes("text-red-700")
                 ui.link("重新选择账户", "/signals?reset_account=1")

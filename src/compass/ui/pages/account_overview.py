@@ -622,11 +622,15 @@ _STATUS_LABELS = {
 }
 
 
-def render_account_overview_page(model: AccountOverviewPageModel | None) -> None:
+def render_account_overview_page(
+    model: AccountOverviewPageModel | None,
+    *,
+    initial_state: AccountOverviewState | None = None,
+) -> None:
     if model is None:
         ui.label("账户总览服务尚未配置").classes("text-negative")
         return
-    state = model.state()
+    state = initial_state if initial_state is not None else model.state()
     guard = EditGuard(scope=".compass-holdings-form")
     profile_options = {item.account_id: item.name for item in state.profiles}
     profile_by_id = {item.account_id: item for item in state.profiles}

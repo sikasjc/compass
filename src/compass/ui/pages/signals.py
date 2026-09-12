@@ -430,11 +430,15 @@ def _side_label(side: DecisionSide) -> tuple[str, str]:
     return "不操作", "text-grey-7"
 
 
-def render_signals_page(model: SignalPageModel | None) -> None:
+def render_signals_page(
+    model: SignalPageModel | None,
+    *,
+    initial_state: SignalPageState | None = None,
+) -> None:
     if model is None:
         ui.label("今日信号服务尚未配置").classes("text-negative")
         return
-    state = model.state()
+    state = initial_state if initial_state is not None else model.state()
     guard = EditGuard(scope=".compass-signal-form")
     choice_by_code = {str(item.instrument): item for item in state.instruments}
     option_labels = {code: _instrument_label(item) for code, item in choice_by_code.items()}

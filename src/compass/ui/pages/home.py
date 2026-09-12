@@ -4,9 +4,9 @@ from dataclasses import dataclass
 from collections.abc import Callable
 from datetime import date
 
-from nicegui import ui
+from nicegui import run, ui
 from compass.ui.pages.watchlists import WatchlistPageModel, WatchlistPageState
-from compass.ui.pages.signals import SignalPageModel
+from compass.ui.pages.signals import SignalPageModel, SignalPageState
 from compass.services.task_manager import TaskManager, TaskStatus
 from compass.ui.task_status import task_status_label
 from compass.ui.navigation import account_url
@@ -19,6 +19,27 @@ class StartPageEntry:
     route: str
     icon: str
     accent: str = "text-slate-700"
+
+
+@dataclass(frozen=True, slots=True)
+class WorkbenchState:
+    watchlist: WatchlistPageState
+    signals: SignalPageState
+    expected_session: date | None
+
+
+def load_workbench_state(
+    watchlists: WatchlistPageModel,
+    signals: SignalPageModel,
+    latest_session: Callable[[], date] | None,
+) -> WorkbenchState:
+    expected = None
+    if latest_session is not None:
+        try:
+            expected = latest_session()
+        except Exception:
+            pass
+    return WorkbenchState(watchlists.state(), signals.state(), expected)
 
 
 _PRIMARY_ENTRIES = (
@@ -133,9 +154,16 @@ def render_start_page(
     signals: SignalPageModel | None = None,
     tasks: TaskManager | None = None,
     latest_session: Callable[[], date] | None = None,
+    initial_state: WorkbenchState | None = None,
 ) -> None:
     if watchlists is not None and signals is not None:
-        render_workbench(watchlists, signals, tasks, latest_session)
+        render_workbench(
+            watchlists,
+            signals,
+            tasks,
+            latest_session,
+            initial_state=initial_state,
+        )
         return
     with ui.card().classes(
         "w-full border-0 shadow-none bg-gradient-to-r from-emerald-50 to-slate-50"
@@ -181,21 +209,31 @@ def render_workbench(
     signals: SignalPageModel,
     tasks: TaskManager | None,
     latest_session: Callable[[], date] | None,
+    *,
+    initial_state: WorkbenchState | None = None,
 ) -> None:
+    loaded: dict[str, WorkbenchState | None] = {"state": initial_state}
+    if loaded["state"] is None:
+        try:
+            loaded["state"] = load_workbench_state(
+                watchlists,
+                signals,
+                latest_session,
+            )
+        except Exception:
+            pass
+
     @ui.refreshable
     def status() -> None:
-        try:
-            watchlist_state = watchlists.state()
-            pool = watchlist_state.entry
-            state = signals.state()
-        except Exception:
+        snapshot = loaded["state"]
+        if snapshot is None:
             ui.label("工作台状态暂不可用，请到日志查看原因。").classes("text-red-700")
             ui.button("查看日志", on_click=lambda: ui.navigate.to("/logs"))
             return
-        try:
-            expected = latest_session() if latest_session else None
-        except Exception:
-            expected = None
+        watchlist_state = snapshot.watchlist
+        pool = watchlist_state.entry
+        state = snapshot.signals
+        expected = snapshot.expected_session
         data_day, data_ready = _market_readiness(watchlist_state, expected)
         data_step_label = "同步完整行情"
         if not data_ready and data_day is not None and expected is not None:
@@ -264,5 +302,17 @@ def render_workbench(
                         "text-red-700" if task.status is TaskStatus.FAILED else "text-sm"
                     )
                 ui.link("查看行情同步历史", "/data")
+    async def refresh_status() -> None:
+        try:
+            loaded["state"] = await run.io_bound(
+                load_workbench_state,
+                watchlists,
+                signals,
+                latest_session,
+            )
+        except Exception:
+            loaded["state"] = None
+        status.refresh()
+
     status()
-    ui.timer(10.0, status.refresh)
+    ui.timer(10.0, refresh_status)
